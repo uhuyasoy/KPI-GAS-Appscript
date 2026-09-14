@@ -30,82 +30,40 @@
  */
 
 // ─── Konfigurasi ────────────────────────────────────────────────────────────
+//
+// Toggle ringkasan tim & granular sekarang diatur dari Command Center (tab
+// _Status via Code.gs), bukan hard-code di sini. Fungsi cfg*_() dibaca dari
+// Code.gs. Yang di bawah hanya setelan tampilan yang jarang berubah.
 
-/** true = ringkasan tim dikirim ke atasan. false = tidak sama sekali. */
-var RINGKASAN_TIM_AKTIF = true;
-
-/**
- * Ambang "di bawah target". Total Skor KPI dinyatakan dalam persen pada
- * data Q3; skor di bawah nilai ini dihitung sebagai belum mencapai target.
- */
-var AMBANG_BAWAH_TARGET = 100;   // persen
+/** Ambang "di bawah target" dalam persen (skor < ini = belum tercapai). */
+var AMBANG_BAWAH_TARGET = 100;
 
 /** Berapa nama yang ditampilkan di daftar teratas dan terbawah. */
 var JUMLAH_SOROTAN = 3;
 
 /** Kolom skor yang dipakai untuk semua perhitungan ringkasan. */
-var KOLOM_SKOR = 'Total Skor KPI';
+var KOLOM_SKOR = 'Skor_KPI';
 
 /**
- * ── GRANULAR: data lengkap tiap bawahan di konteks atasan (Cara 1) ──
- *
- * Ketika aktif untuk sebuah role, atasan role itu menerima data granular
- * SETIAP bawahannya di konteks, sehingga bisa ditanya per individu.
- *
- * PERINGATAN SKALA: RM dan HMB bisa punya ratusan bawahan. Mengaktifkan
- * granular untuk mereka membuat konteks membengkak di SETIAP query, bukan
- * hanya saat menanyakan bawahan. Biarkan false kecuali untuk pengujian.
- *
- * Toggle utama: set false untuk mematikan granular sepenuhnya dalam sekejap.
+ * ── GRANULAR: data lengkap tiap bawahan di konteks atasan ──
+ * Toggle (aktif, role, batas) diatur dari Command Center (_Status via Code.gs).
+ * Yang tetap di sini hanya daftar kolom yang dibawa.
  */
-var GRANULAR_AKTIF = true;
-
-/** Role mana yang menerima data granular bawahan. Hapus dari daftar untuk mematikan. */
-var GRANULAR_UNTUK_ROLE = ['BM'];   // aman untuk tes; tambah 'AM','RM' dengan sadar
 
 /**
  * Kolom bawahan yang dibawa ke konteks granular. Dibatasi agar konteks
  * tidak meledak. Kosongkan array ([]) untuk membawa SEMUA kolom.
  */
 var GRANULAR_KOLOM = [
-  'Total Skor KPI', 'Rangking', 'Grouping Skor KPI',
-  'Kena Boom?', 'Dapat Boost?', 'Parameter yang belum tercapai'
+  'Skor_KPI', 'Ranking', 'Grouping_Skor_KPI',
+  'Boom', 'Boost', 'Parameter_Unreached', 'KPI_Status'
 ];
 
-/**
- * Batas jumlah bawahan yang di-inject granular per atasan.
- *
- * Cara mengatur, dari paling sederhana:
- *   - Angka biasa (mis. 40): berlaku untuk semua role yang granular-nya aktif.
- *   - 0 atau -1: TANPA BATAS — semua bawahan di-inject berapa pun jumlahnya.
- *   - Objek per-role: batas berbeda tiap role, mis.
- *       { BM: 0, AM: 60, RM: 100 }   (BM tanpa batas, AM maks 60, RM maks 100)
- *     Role yang tidak disebut memakai GRANULAR_MAKS_DEFAULT.
- *
- * PERINGATAN: tanpa batas untuk RM/HMB bisa membuat konteks sangat besar di
- * setiap query mereka. Aman untuk BM. Untuk role besar, pakai angka.
- */
-var GRANULAR_MAKS_BAWAHAN = 10;        // 0 = tanpa batas (untuk testing penuh)
-
-/** Dipakai bila GRANULAR_MAKS_BAWAHAN berupa objek dan role tidak tercantum. */
-var GRANULAR_MAKS_DEFAULT = 40;
-
-/**
- * Kembalikan batas efektif untuk sebuah role.
- * Mengembalikan 0 berarti tanpa batas.
- */
+/** Batas efektif bawahan granular untuk sebuah role (0 = tanpa batas). */
 function batasGranular_(role) {
-  var b = GRANULAR_MAKS_BAWAHAN;
-
-  // Bentuk objek per-role.
-  if (b && typeof b === 'object') {
-    if (b.hasOwnProperty(role)) b = b[role];
-    else b = GRANULAR_MAKS_DEFAULT;
-  }
-
-  var n = Number(b);
-  if (isNaN(n) || n < 0) return 0;   // nilai aneh atau negatif -> tanpa batas
-  return n;                          // 0 = tanpa batas
+  var n = (typeof cfgGranularMaks_ === 'function') ? cfgGranularMaks_() : 10;
+  if (isNaN(n) || n < 0) return 0;
+  return n;
 }
 
 // ─── Pembacaan arsip jadi baris per orang ───────────────────────────────────
@@ -114,64 +72,16 @@ function batasGranular_(role) {
  * Kumpulkan seluruh karyawan (periode terbaru) dari empat arsip menjadi
  * daftar objek datar dengan wilayah dan skor. Ini bahan dasar semua ringkasan.
  */
+/**
+ * Ambil semua karyawan dari sumber PROD (via Code.gs). Menggantikan pembacaan
+ * arsip lama — sekarang data berasal dari DB_Perf + DB_Employee dengan minggu
+ * terbaru (dan gating periode final) yang sudah ditangani di Code.gs.
+ */
 function bacaSemuaKaryawan_() {
-  var orangMap = {}; // key: nik -> object orang (otomatis dedup NIK)
-  var targetPeriode = (typeof getPeriodeTarget_ === 'function') ? getPeriodeTarget_() : '';
-  SEMUA_ARSIP.forEach(function (arsipName) {
-    var sheet = ss_().getSheetByName(arsipName);
-    if (!sheet || sheet.getLastRow() < 2) return;
-    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    var iPer   = headers.indexOf('periode');
-    var iRole  = headers.indexOf('role');
-    var iNik   = findColIdx_(headers, KEY_NIK);
-    var iNama  = findColIdx_(headers, KEY_NAMA);
-    var iPoint = findColIdx_(headers, 'point');
-    var iArea  = findColIdx_(headers, 'area');
-    var iReg   = findColIdx_(headers, 'regional');
-    var iPulau = findColIdx_(headers, 'pulau');
-    var iSkor  = findColIdx_(headers, KOLOM_SKOR.toLowerCase());
-    var adaTarget = targetPeriode && data.some(function (r) { 
-      var p = typeof formatPeriodeCell_ === 'function' ? formatPeriodeCell_(r[iPer]) : String(r[iPer]).trim();
-      return p === targetPeriode; 
-    });
-    var latest = '';
-    if (!adaTarget) {
-      data.forEach(function (r) {
-        var p = typeof formatPeriodeCell_ === 'function' ? formatPeriodeCell_(r[iPer]) : String(r[iPer]).trim();
-        if (p > latest) latest = p;
-      });
-    }
-    var periodeDipakai = adaTarget ? targetPeriode : latest;
-    data.forEach(function (r) {
-      var periode = typeof formatPeriodeCell_ === 'function' ? formatPeriodeCell_(r[iPer]) : String(r[iPer]).trim();
-      if (periode !== periodeDipakai) return;
-      var nik = iNik >= 0 ? String(r[iNik]).trim() : '';
-      if (!nik) return;
-      var skipIdx = [iPer, iRole, iNik, iNama, iPoint, iArea, iReg, iPulau];
-      var kpi = {};
-      headers.forEach(function (h, i) {
-        if (skipIdx.indexOf(i) >= 0) return;
-        if (!h || h === 'kategori_point') return;
-        var v = r[i];
-        if (v === '' || v === null) return;
-        kpi[String(h).trim()] = v;
-      });
-      // Simpan ke map. Jika ada NIK yang sama di bulan ini, baris bawah menggantikan baris atas
-      orangMap[nik] = {
-        nik: nik,
-        nama: iNama >= 0 ? String(r[iNama]).trim() : '',
-        role: String(r[iRole]).trim(),
-        point: iPoint >= 0 ? String(r[iPoint]).trim() : '',
-        area: iArea >= 0 ? String(r[iArea]).trim() : '',
-        regional: iReg >= 0 ? String(r[iReg]).trim() : '',
-        pulau: iPulau >= 0 ? String(r[iPulau]).trim() : '',
-        skor: iSkor >= 0 ? skorKeSkala_(r[iSkor]) : null,
-        kpi: kpi
-      };
-    });
-  });
-  return Object.keys(orangMap).map(function (k) { return orangMap[k]; });
+  if (typeof bacaSemuaKaryawanProd_ === 'function') {
+    return bacaSemuaKaryawanProd_();
+  }
+  return [];
 }
 
 
@@ -249,7 +159,7 @@ function fmtSorotan_(o) {
  * Dipanggil dari buildUsers_ di Code.gs; hasilnya digabung ke record user.
  */
 function ringkasanTimPerNik_() {
-  if (!RINGKASAN_TIM_AKTIF) return {};
+  if (!cfgRingkasanTimAktif_()) return {};
   var semua = bacaSemuaKaryawan_();
   if (!semua.length) return {};
   var regToPulau = petaRegionalKePulau_(semua);
@@ -282,7 +192,7 @@ function ringkasanTimPerNik_() {
     }
     if (!bawahan.length) return;
     var rec = ringkasKelompok_(bawahan, 'Tim - ');
-    if (GRANULAR_AKTIF && GRANULAR_UNTUK_ROLE.indexOf(atasan.role) >= 0) {
+    if (cfgGranularAktif_() && cfgGranularRole_().indexOf(atasan.role) >= 0) {
       var batas = batasGranular_(atasan.role);
       if (batas > 0 && bawahan.length > batas) {
         rec['Tim - Catatan Detail'] =
@@ -321,7 +231,10 @@ function tempelGranular_(rec, bawahan) {
 
       var v = b.kpi[kolom];
       if (v === '' || v === null || v === undefined) return;
-      rec[prefix + kolom] = (typeof normalisasiNilai_ === 'function')
+      // Rapikan nama kolom agar konsisten dengan payload utama.
+      var label = (typeof labelKpi_ === 'function') ? labelKpi_(kolom) : kolom;
+      if (!label) return;
+      rec[prefix + label] = (typeof normalisasiNilai_ === 'function')
         ? normalisasiNilai_(v, kolom) : v;
     });
   });
