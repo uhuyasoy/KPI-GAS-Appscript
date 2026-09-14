@@ -1,178 +1,243 @@
 /**
  * ============================================================================
- * AI FO Employee Performance Database — Capture & Serve
+ * Code.gs — AI Trainer KPI sync (sumber: PROD-DB-KPI-FO)
  * ============================================================================
- * Spreadsheet ini adalah ARSIP PERMANEN. Data di-capture sebagai static values
- * dari KPI FO Tracker, sehingga tetap berdiri walau source dihapus/dicabut.
+ * Sumber data BARU: satu spreadsheet PROD-DB-KPI-FO berisi:
+ *   - DB_Employee            : identitas + wilayah (NIK -> Point/Area/Regional/Pulau)
+ *   - DB_Perf_BP/BM/AM/RM     : performa per role, kolom P01_.. P05_.., BOOM_.., BOOST_..
+ *   - Daftar HMB              : didaftarkan manual (dipakai Team.gs)
  *
- * FLOW:
- *   KPI FO Tracker (view-only)
- *     -> [Menu: Capture Bulan Ini] -> Arsip BP / Arsip BM  (static values)
- *     -> [Menu: Hitung Agregat]    -> Agregat Point
- *     -> doGet()                    -> FastAPI /ingest/spreadsheet/sync
+ * Alur: baca DB_Perf_<role> -> join ke DB_Employee via NIK -> ambil minggu
+ * terbaru per NIK -> normalisasi nilai -> doGet kirim JSON ke backend.
  *
- * SETUP:
- *   1. Extensions -> Apps Script -> paste file ini sebagai Code.gs
- *   2. Project Settings -> Script Properties:
- *        SOURCE_SPREADSHEET_ID = 1BmihElRczJKkuxJ_Rc_mQO1TQpAIpBDovIJBW8zXgWg
- *        SYNC_TOKEN            = <samakan dgn SPREADSHEET_SYNC_TOKEN di .env>
- *   3. Reload spreadsheet -> menu "FO Performance" muncul
- *   4. Menu -> "Setup Sheets" (sekali saja)
- *   5. Menu -> "Capture Bulan Ini" -> pilih periode & role
- *   6. Menu -> "Hitung Agregat Point"
- *   7. Deploy -> New deployment -> Web app
- *        Execute as: Me | Access: Anyone with the link
- *   8. Copy URL deployment -> isi SPREADSHEET_SYNC_URL di .env backend
+ * SETUP (Script Properties):
+ *   PROD_SPREADSHEET_ID = <id spreadsheet PROD-DB-KPI-FO>
+ *   SYNC_TOKEN          = <samakan dengan SPREADSHEET_SYNC_TOKEN di .env>
  * ============================================================================
  */
 
-// ─── Konstanta ──────────────────────────────────────────────────────────────
+// ─── Nama tab sumber ─────────────────────────────────────────────────────────
 
-var ARSIP_BP      = 'Arsip BP';
-var ARSIP_BM      = 'Arsip BM';
-var ARSIP_AM      = 'Arsip AM';
-var ARSIP_RM      = 'Arsip RM';
-var AGREGAT_POINT = 'Agregat Point';
-var CONFIG_SHEET  = '_Config';
-var LOG_SHEET     = 'Log Ketidakcocokan';
-var HMB_SHEET     = 'Daftar HMB';
+var EMP_SHEET = 'DB_Employee';
+var PERF_SHEET = {
+  BP: 'DB_Perf_BP',
+  BM: 'DB_Perf_BM',
+  AM: 'DB_Perf_AM',
+  RM: 'DB_Perf_RM'
+};
+var HMB_SHEET = 'Daftar HMB';
+
+// ─── Konfigurasi via tab _Status (command center) ────────────────────────────
+//
+// Semua perilaku pengiriman diatur dari tab _Status, bukan hard-code. Command
+// center (web app) menulis ke tab ini; doGet & builder membacanya. Kalau tab
+// belum ada, dipakai DEFAULT_CONFIG di bawah.
+
+var STATUS_SHEET = '_Status';
+
+var DEFAULT_CONFIG = {
+  periode_final: '',          // "" = pakai periode terbaru yang ada (belum ada gating)
+  role_dikirim: 'BP,BM',      // daftar role dipisah koma
+  sembunyikan_insentif: 'false',
+  kolom_disembunyikan: '',    // daftar kata dipisah koma
+  kirim_riwayat: 'false',
+  kirim_agregat_point: 'false',
+  ringkasan_tim_aktif: 'true',    // ringkasan tim untuk atasan
+  granular_aktif: 'false',        // data lengkap tiap bawahan di konteks atasan
+  granular_untuk_role: 'BM',      // role penerima granular, dipisah koma
+  granular_maks_bawahan: '10'     // batas bawahan granular per atasan (0 = tanpa batas)
+};
+
+// Cache config selama satu eksekusi agar tidak baca sheet berulang.
+var _configCache = null;
+
+function getKonfig_() {
+  if (_configCache) return _configCache;
+  var cfg = {};
+  Object.keys(DEFAULT_CONFIG).forEach(function (k) { cfg[k] = DEFAULT_CONFIG[k]; });
+
+  var sheet = ss_().getSheetByName(STATUS_SHEET);
+  if (sheet && sheet.getLastRow() >= 2) {
+    var v = sheet.getRange(1, 1, sheet.getLastRow(), 2).getValues();
+    for (var r = 1; r < v.length; r++) {
+      var key = String(v[r][0]).trim().toLowerCase();
+      if (key && DEFAULT_CONFIG.hasOwnProperty(key)) {
+        cfg[key] = String(v[r][1]).trim();
+      }
+    }
+  }
+  _configCache = cfg;
+  return cfg;
+}
+
+// ─── Command center: tulis config, password, deteksi periode ─────────────────
+
+/** Tulis satu key config ke tab _Status (dibuat bila belum ada). */
+function setKonfig_(key, value) {
+  key = String(key).trim().toLowerCase();
+  if (!DEFAULT_CONFIG.hasOwnProperty(key)) throw new Error('Key config tidak dikenal: ' + key);
+
+  var sheet = ss_().getSheetByName(STATUS_SHEET);
+  if (!sheet) {
+    sheet = ss_().insertSheet(STATUS_SHEET);
+    sheet.getRange(1, 1, 1, 2).setValues([['key', 'value']]).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    // isi default supaya lengkap
+    var rows = Object.keys(DEFAULT_CONFIG).map(function (k) { return [k, DEFAULT_CONFIG[k]]; });
+    sheet.getRange(2, 1, rows.length, 2).setValues(rows);
+  }
+
+  var v = sheet.getRange(1, 1, sheet.getLastRow(), 2).getValues();
+  for (var r = 1; r < v.length; r++) {
+    if (String(v[r][0]).trim().toLowerCase() === key) {
+      sheet.getRange(r + 1, 2).setValue(value);
+      _configCache = null;
+      return;
+    }
+  }
+  sheet.appendRow([key, value]);
+  _configCache = null;
+}
+
+/** Verifikasi password command center terhadap Script Property CC_PASSWORD. */
+function cekPassword_(input) {
+  var pw = PropertiesService.getScriptProperties().getProperty('CC_PASSWORD') || '';
+  if (!pw) return false;                 // belum diset -> tolak semua
+  return String(input).trim() === String(pw).trim();
+}
 
 /**
- * false = ambil SEMUA karyawan dari source; daftar point hanya dipakai
- *         untuk mengisi kolom kategori_point (post_fraud / bottom_performance).
- * true  = hanya karyawan di point terdaftar yang disimpan (perilaku lama).
- *
- * Tab AM dan RM tidak punya kolom Point, sehingga selalu ikut terambil
- * tanpa memandang nilai ini.
+ * Diagnosa password — JALANKAN DARI EDITOR (Run), lihat hasil di Execution log.
+ * Tidak menampilkan password, hanya apakah ter-set dan panjangnya, supaya aman.
  */
-var FILTER_AKTIF = false;
+function cekSetupPassword() {
+  var pw = PropertiesService.getScriptProperties().getProperty('CC_PASSWORD');
+  if (pw === null || pw === undefined) {
+    Logger.log('CC_PASSWORD BELUM ADA di Script Properties. Tambahkan dulu.');
+    return;
+  }
+  if (String(pw).trim() === '') {
+    Logger.log('CC_PASSWORD ADA tapi KOSONG/berisi spasi saja.');
+    return;
+  }
+  Logger.log('CC_PASSWORD ter-set. Panjang: ' + pw.length +
+    ' | ada spasi di ujung: ' + (pw !== pw.trim() ? 'YA (masalah!)' : 'tidak'));
+  // Cek juga PROD id sekalian
+  var pid = PropertiesService.getScriptProperties().getProperty('PROD_SPREADSHEET_ID');
+  Logger.log('PROD_SPREADSHEET_ID: ' + (pid ? 'ter-set' : 'BELUM ADA'));
+}
 
-/**
- * Kolom yang disembunyikan dari SEMUA role. Isi dengan potongan nama kolom
- * (case-insensitive, cocok sebagian). Kolom yang namanya mengandung salah
- * satu kata di sini tidak akan dikirim ke Ava.
- *
- * Untuk menyalakan kembali sebuah kolom, hapus katanya dari daftar lalu
- * Deploy ulang (Manage deployments -> Edit -> New version).
- */
-var KOLOM_DISEMBUNYIKAN = [
-  'total insentif'   // insentif disembunyikan sementara atas permintaan
-];
+/** Daftar periode (label) yang ada di semua tab DB_Perf, urut terbaru dulu. */
+function daftarPeriode_() {
+  var set = {};
+  ['BP', 'BM', 'AM', 'RM'].forEach(function (role) {
+    var sheet = prodSS_().getSheetByName(PERF_SHEET[role]);
+    if (!sheet || sheet.getLastRow() < 2) return;
+    var lastCol = sheet.getLastColumn();
+    var header = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+                 .map(function (h) { return String(h).trim().toLowerCase(); });
+    var iPer = header.indexOf('perioda_tanggal');
+    if (iPer < 0) return;
+    var col = sheet.getRange(2, iPer + 1, sheet.getLastRow() - 1, 1).getValues();
+    col.forEach(function (r) {
+      var label = String(r[0] || '').trim();
+      if (!label) return;
+      var key = parsePeriodeMingguan_(label).key;
+      set[key] = label;
+    });
+  });
+  return Object.keys(set).sort().reverse().map(function (k) {
+    return { key: k, label: set[k] };
+  });
+}
 
-/** true = kolom insentif disembunyikan; false = ditampilkan. */
-var SEMBUNYIKAN_INSENTIF = true;
+/** Hitung jumlah baris per role untuk sebuah periode (untuk cek kelengkapan). */
+function kelengkapanPeriode_(label) {
+  var targetKey = parsePeriodeMingguan_(label).key;
+  var hasil = {};
+  ['BP', 'BM', 'AM', 'RM'].forEach(function (role) {
+    var sheet = prodSS_().getSheetByName(PERF_SHEET[role]);
+    if (!sheet || sheet.getLastRow() < 2) { hasil[role] = 0; return; }
+    var lastCol = sheet.getLastColumn();
+    var header = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+                 .map(function (h) { return String(h).trim().toLowerCase(); });
+    var iPer = header.indexOf('perioda_tanggal');
+    var col = sheet.getRange(2, iPer + 1, sheet.getLastRow() - 1, 1).getValues();
+    var n = 0;
+    col.forEach(function (r) {
+      if (parsePeriodeMingguan_(String(r[0] || '').trim()).key === targetKey) n++;
+    });
+    hasil[role] = n;
+  });
+  return hasil;
+}
 
-/**
- * Cek apakah sebuah kolom harus disembunyikan dari konteks.
- * Menggabungkan daftar umum dengan toggle khusus insentif.
- */
+function roleDikirim_(role) {
+  var daftar = getKonfig_().role_dikirim.split(',').map(function (s) {
+    return s.trim().toUpperCase();
+  });
+  return daftar.indexOf(String(role).trim().toUpperCase()) >= 0;
+}
+
 function kolomDisembunyikan_(namaKolom) {
-  var h = String(namaKolom).toLowerCase().trim();
-  if (SEMBUNYIKAN_INSENTIF && /insentif/.test(h)) return true;
-  if (/\(\d+\)$/.test(h)) return true;          // Buang kolom duplikat "(2)"
-  if (/^cek double$/i.test(h)) return true;     // Buang kolom audit
-  for (var i = 0; i < KOLOM_DISEMBUNYIKAN.length; i++) {
-    if (h.indexOf(KOLOM_DISEMBUNYIKAN[i].toLowerCase()) >= 0) return true;
+  var cfg = getKonfig_();
+  var h = String(namaKolom).toLowerCase();
+  if (/^true$/i.test(cfg.sembunyikan_insentif) && /insentif/.test(h)) return true;
+  var extra = cfg.kolom_disembunyikan.split(',').map(function (s) { return s.trim().toLowerCase(); });
+  for (var i = 0; i < extra.length; i++) {
+    if (extra[i] && h.indexOf(extra[i]) >= 0) return true;
   }
   return false;
 }
 
-var SEMUA_ARSIP = [ARSIP_BP, ARSIP_BM, ARSIP_AM, ARSIP_RM];
+function kirimRiwayat_() { return /^true$/i.test(getKonfig_().kirim_riwayat); }
+function periodeFinal_() { return getKonfig_().periode_final; }
 
-/**
- * Role yang datanya dikirim ke backend (Postgres) lewat doGet.
- * AM dan RM sengaja tidak disertakan karena integrasinya masih berjalan —
- * definisi & bobot mereka belum final. Tambahkan 'AM','RM' di sini ketika
- * sudah siap, lalu Deploy ulang. Ini TIDAK menghentikan capture ke arsip;
- * arsip tetap boleh terisi, hanya pengirimannya yang ditahan.
- */
-var ROLE_DIKIRIM = ['BP', 'BM'];
-
-/** Cek apakah data sebuah role boleh dikirim ke backend. */
-function roleDikirim_(role) {
-  return ROLE_DIKIRIM.indexOf(String(role).trim().toUpperCase()) >= 0;
+// Config untuk Team.gs (ringkasan tim & granular) — dibaca dari _Status.
+function cfgRingkasanTimAktif_() { return /^true$/i.test(getKonfig_().ringkasan_tim_aktif); }
+function cfgGranularAktif_() { return /^true$/i.test(getKonfig_().granular_aktif); }
+function cfgGranularRole_() {
+  return getKonfig_().granular_untuk_role.split(',').map(function (s) {
+    return s.trim().toUpperCase();
+  }).filter(Boolean);
+}
+function cfgGranularMaks_() {
+  var n = parseInt(getKonfig_().granular_maks_bawahan, 10);
+  return isNaN(n) ? 0 : n;
 }
 
-/** Tentukan tab arsip berdasarkan role yang terbaca dari nama tab source. */
-function arsipUntukRole_(role) {
-  if (role === 'BM') return ARSIP_BM;
-  if (role === 'AM') return ARSIP_AM;
-  if (role === 'RM') return ARSIP_RM;
-  return ARSIP_BP;
-}
+// KIRIM_AGREGAT_POINT dipakai buildBranchesFull_.
+function get_KIRIM_AGREGAT_POINT_() { return /^true$/i.test(getKonfig_().kirim_agregat_point); }
 
-var FILTER_SHEETS = {
-  post_fraud:       'Point Post-Fraud',
-  bottom_performance: '185 Point Bot Perf'
-};
+var RIWAYAT_MINGGU = 4;
+var RIWAYAT_KOLOM = [
+  'Skor_KPI', 'Ranking', 'Grouping_Skor_KPI',
+  'Boom', 'Boost', 'Parameter_Unreached', 'KPI_Status'
+];
 
-// Hanya sync periode terbaru ke backend (Opsi A).
-// Ubah ke true kalau lead sudah minta data historis.
-// Riwayat performa bulan lama. Periode terbaru selalu tampil penuh sebagai
-// data utama; bulan sebelumnya dikirim sebagai rangkuman ringkas dengan
-// awalan "Riwayat <bulan> -". Instruksi KB mengatur agar Ava hanya memakai
-// riwayat ketika user menyebut bulannya.
-// Baris header di sheet source (Jul - BP / Jul - BM). Data mulai baris 5.
-var SOURCE_HEADER_ROW = 4;
-var SOURCE_DATA_ROW   = 5;
-
-// Kolom identitas di source (nama header, case-insensitive).
-var KEY_NIK   = 'nik';
-var KEY_NAMA  = 'nama';
-var KEY_POINT = 'point';
-
-// ─── Ganti bagian konfigurasi riwayat (baris ~96) ──────────────────────────
-var KIRIM_RIWAYAT = false;
-
-/**
- * Mengembalikan periode H-1 dari bulan berjalan (format "YYYY-MM").
- * Misal: September 2026 -> "2026-08" (Agustus).
- */
-function getPeriodeTarget_() {
-  var d = new Date();
-  d.setDate(1); // amankan bug tanggal 31
-  d.setMonth(d.getMonth() - 1);
-  var m = ('0' + (d.getMonth() + 1)).slice(-2);
-  return d.getFullYear() + '-' + m;
-}
-
-/**
- * Konversi cell periode (Date object / String) menjadi format "YYYY-MM" murni.
- */
-function formatPeriodeCell_(v) {
-  if (!v) return '';
-  if (v instanceof Date) {
-    var m = v.getMonth() + 1;
-    return v.getFullYear() + '-' + (m < 10 ? '0' + m : m);
-  }
-  var s = String(v).trim();
-  if (s.length >= 7 && s.charAt(4) === '-') return s.substring(0, 7);
-  var d = new Date(s);
-  if (!isNaN(d.getTime())) {
-    var m2 = d.getMonth() + 1;
-    return d.getFullYear() + '-' + (m2 < 10 ? '0' + m2 : m2);
-  }
-  return s;
-}
-
-var MONTH_NAMES = {
-  'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'mei': '05', 'may': '05',
-  'jun': '06', 'jul': '07', 'agu': '08', 'aug': '08', 'sep': '09',
-  'okt': '10', 'oct': '10', 'nov': '11', 'des': '12', 'dec': '12'
-};
-
-// ─── Config helpers ─────────────────────────────────────────────────────────
+// ─── Helpers dasar ───────────────────────────────────────────────────────────
 
 function getConfig_() {
   var props = PropertiesService.getScriptProperties();
   return {
-    sourceId: props.getProperty('SOURCE_SPREADSHEET_ID') || '',
+    prodId: props.getProperty('PROD_SPREADSHEET_ID') || '',
     syncToken: props.getProperty('SYNC_TOKEN') || ''
   };
 }
 
+/**
+ * Spreadsheet aktif. Di web app tidak ada "active spreadsheet", jadi selalu
+ * buka lewat PROD_SPREADSHEET_ID. getActiveSpreadsheet() hanya dipakai sebagai
+ * fallback saat dijalankan dari editor/menu (mis. saat ID belum diisi).
+ */
 function ss_() {
-  return SpreadsheetApp.getActiveSpreadsheet();
+  var cfg = getConfig_();
+  if (cfg.prodId) {
+    try { return SpreadsheetApp.openById(cfg.prodId); } catch (e) { /* fallback */ }
+  }
+  var active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return active;
+  throw new Error('PROD_SPREADSHEET_ID belum diisi di Script Properties, dan tidak ada spreadsheet aktif. Isi PROD_SPREADSHEET_ID dulu.');
 }
 
 function sheetOrCreate_(name) {
@@ -181,551 +246,409 @@ function sheetOrCreate_(name) {
   return s;
 }
 
-// ─── Menu ───────────────────────────────────────────────────────────────────
-
-function onOpen() {
-  var ui = SpreadsheetApp.getUi();
-  ui.createMenu('FO Performance')
-    .addItem('Setup Sheets', 'setupSheets')
-    .addSeparator()
-    .addItem('Capture Bulan Ini', 'showCaptureDialog')
-    .addItem('Hitung Agregat Point', 'hitungAgregat')
-    .addSeparator()
-    .addItem('Cek Koneksi Source', 'cekKoneksiSource')
-    .addItem('Audit Daftar Point', 'auditDaftarPoint')
-    .addItem('Ringkasan Arsip', 'ringkasanArsip')
-    .addSeparator()
-    .addItem('Preview Data HMB', 'previewHmb')
-    .addSubMenu(menuBcp_(ui))
-    .addToUi();
+/** Buka spreadsheet PROD. Sama dengan ss_ karena semua data ada di PROD. */
+function prodSS_() {
+  return ss_();
 }
 
-function setupSheets() {
-  SEMUA_ARSIP.concat([AGREGAT_POINT, CONFIG_SHEET, LOG_SHEET, ARSIP_BCP, HMB_SHEET])
-    .forEach(function (n) { sheetOrCreate_(n); });
-
-  // Beri header awal untuk Daftar HMB kalau masih kosong.
-  var hmb = ss_().getSheetByName(HMB_SHEET);
-  if (hmb && hmb.getLastRow() === 0) {
-    hmb.getRange(1, 1, 1, 4).setValues([['Role', 'NIK', 'Nama', 'Pulau']])
-       .setFontWeight('bold');
-    hmb.setFrozenRows(1);
-  }
-
-  var cfg = sheetOrCreate_(CONFIG_SHEET);
-  if (cfg.getLastRow() === 0) {
-    cfg.getRange(1, 1, 1, 4)
-      .setValues([['periode', 'role', 'source_tab', 'captured_at']])
-      .setFontWeight('bold');
-    cfg.setFrozenRows(1);
-  }
-
-  var agg = sheetOrCreate_(AGREGAT_POINT);
-  if (agg.getLastRow() === 0) {
-    agg.getRange(1, 1, 1, 10).setValues([[
-      'periode', 'point', 'role', 'jumlah_karyawan', 'rata_rata_skor_kpi',
-      'jumlah_kena_boom', 'jumlah_dapat_boost', 'parameter_paling_sering_gagal',
-      'kategori_point', 'updated_at'
-    ]]).setFontWeight('bold');
-    agg.setFrozenRows(1);
-  }
-
-  ss_().toast('Sheets siap. Lanjut ke "Capture Bulan Ini".', 'FO Performance');
+/** Normalisasi NIK agar join tidak gagal karena string vs float. */
+function normNik_(v) {
+  if (v === null || v === undefined) return '';
+  var s = String(v).trim();
+  if (!s) return '';
+  return s.replace(/\.0+$/, '');   // buang ".0" artefak angka
 }
 
-// ─── Cek koneksi ────────────────────────────────────────────────────────────
+// ─── Periode mingguan ────────────────────────────────────────────────────────
 
-function cekKoneksiSource() {
-  var cfg = getConfig_();
-  var ui = SpreadsheetApp.getUi();
+var BULAN_MAP = {
+  'januari': '01', 'februari': '02', 'maret': '03', 'april': '04',
+  'mei': '05', 'juni': '06', 'juli': '07', 'agustus': '08',
+  'september': '09', 'oktober': '10', 'november': '11', 'desember': '12',
+  'january': '01', 'february': '02', 'march': '03', 'may': '05',
+  'june': '06', 'july': '07', 'august': '08', 'october': '10', 'december': '12'
+};
 
-  if (!cfg.sourceId) {
-    ui.alert('SOURCE_SPREADSHEET_ID belum diisi di Script Properties.');
-    return;
-  }
-
-  try {
-    var src = SpreadsheetApp.openById(cfg.sourceId);
-    var names = src.getSheets().map(function (s) { return s.getName(); });
-    ui.alert(
-      'Koneksi OK\n\nSource: ' + src.getName() +
-      '\n\nTab tersedia:\n' + names.join('\n')
-    );
-  } catch (e) {
-    ui.alert('Gagal buka source.\n\n' + e.message +
-      '\n\nPastikan akun ini punya akses view ke spreadsheet tsb.');
-  }
+/** "Week 1 - September 2026" -> { key:"2026-09-W01", label:"Week 1 - September 2026" } */
+function parsePeriodeMingguan_(s) {
+  var str = String(s || '').trim();
+  var m = str.match(/week\s*(\d+)\s*-\s*([a-z]+)\s*(\d{4})/i);
+  if (!m) return { key: str, label: str };
+  var w = ('0' + m[1]).slice(-2);
+  var bl = BULAN_MAP[m[2].toLowerCase()] || '00';
+  return { key: m[3] + '-' + bl + '-W' + w, label: str };
 }
 
-// ─── Capture ────────────────────────────────────────────────────────────────
+// ─── Baca DB_Employee ────────────────────────────────────────────────────────
 
-function showCaptureDialog() {
-  var cfg = getConfig_();
-  var ui = SpreadsheetApp.getUi();
+/** Peta NIK -> {point, area, regional, pulau, position}. */
+function bacaEmployee_() {
+  var sheet = prodSS_().getSheetByName(EMP_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return {};
 
-  if (!cfg.sourceId) {
-    ui.alert('SOURCE_SPREADSHEET_ID belum diisi di Script Properties.');
-    return;
+  var lastCol = sheet.getLastColumn();
+  var values = sheet.getRange(1, 1, sheet.getLastRow(), lastCol).getValues();
+  var header = values[0].map(function (h) { return String(h).trim().toLowerCase(); });
+
+  var idx = {};
+  header.forEach(function (h, i) { idx[h] = i; });
+  var iNik = idx['nik'], iPoint = idx['point'], iArea = idx['area'],
+      iReg = idx['regional'], iPulau = idx['pulau'], iPos = idx['position'];
+
+  var peta = {};
+  for (var r = 1; r < values.length; r++) {
+    var nik = normNik_(values[r][iNik]);
+    if (!nik) continue;
+
+    var position = iPos != null ? String(values[r][iPos] || '').trim() : '';
+    // Buang karyawan Head Office — bukan FO, tidak relevan untuk KPI FO.
+    if (/^ho$/i.test(position)) continue;
+
+    peta[nik] = {
+      point: iPoint != null ? String(values[r][iPoint] || '').trim() : '',
+      area: iArea != null ? String(values[r][iArea] || '').trim() : '',
+      regional: iReg != null ? String(values[r][iReg] || '').trim() : '',
+      pulau: iPulau != null ? String(values[r][iPulau] || '').trim() : '',
+      position: position
+    };
+  }
+  return peta;
+}
+
+// ─── Baca DB_Perf_<role> ─────────────────────────────────────────────────────
+
+/**
+ * Baca satu tab performa. Kembalikan { byNik: {nik: {periode->record}}, ... }.
+ * Tiap record: { periodeKey, periodeLabel, nama, role, kpi:{kolom->nilai} }.
+ * Kolom identitas & meta dipisah dari kpi.
+ */
+function bacaPerf_(role) {
+  var tabName = PERF_SHEET[role];
+  var sheet = prodSS_().getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) return {};
+
+  var lastCol = sheet.getLastColumn();
+  var values = sheet.getRange(1, 1, sheet.getLastRow(), lastCol).getValues();
+  var header = values[0].map(function (h) { return String(h).trim(); });
+
+  var idx = {};
+  header.forEach(function (h, i) { idx[h.toLowerCase()] = i; });
+  var iNik = idx['nik'], iNama = idx['fullname'], iRole = idx['role'],
+      iPer = idx['perioda_tanggal'];
+
+  // Kolom yang bukan KPI (identitas + meta yang ditangani khusus).
+  var kolomMeta = ['nik', 'fullname', 'role', 'perioda_tanggal'];
+
+  var byNik = {};
+  for (var r = 1; r < values.length; r++) {
+    var nik = normNik_(values[r][iNik]);
+    if (!nik) continue;
+
+    var per = parsePeriodeMingguan_(values[r][iPer]);
+    var kpi = {};
+    header.forEach(function (h, i) {
+      if (kolomMeta.indexOf(h.toLowerCase()) >= 0) return;
+      var v = values[r][i];
+      if (v === '' || v === null || v === undefined) return;
+      kpi[h] = v;
+    });
+
+    if (!byNik[nik]) byNik[nik] = { nama: '', role: role, snapshots: {} };
+    byNik[nik].nama = String(values[r][iNama] || '').trim();
+    byNik[nik].snapshots[per.key] = { label: per.label, kpi: kpi };
+  }
+  return byNik;
+}
+
+// ─── Normalisasi nilai ───────────────────────────────────────────────────────
+
+/**
+ * Rapikan nilai untuk konteks Ava.
+ * - Desimal rasio (<=3) jadi persen: 0.98 -> 98.00%, 1.2 -> 120.00%.
+ * - Kolom Rupiah (_IDR, insentif, amount) jadi Rp dengan pemisah ribuan.
+ * - Kolom count (NOA, ranking) dibiarkan angka.
+ */
+function normalisasiNilai_(v, namaKolom) {
+  var s = String(v).trim();
+  if (!s) return s;
+  var nama = String(namaKolom || '');
+
+  // Kolom teks/kategori: jangan pernah diubah jadi angka meski mengandung
+  // angka atau '%'. Contoh: Grouping "1.<80%", Status "1. Need Improvement",
+  // Parameter_Unreached (daftar teks), periode, nama.
+  if (/grouping|status|parameter|perioda|fullname|^role$|unreached/i.test(nama)) {
+    return s;
   }
 
-  var resp = ui.prompt(
-    'Capture Data',
-    'Masukkan nama tab source, pisahkan koma kalau lebih dari satu.\n' +
-    'Contoh: Jul - BP, Jul - BM, Jul - AM, Jul - RM\n\n' +
-    'Tab dengan ribuan baris sebaiknya dijalankan satu per satu\n' +
-    'agar tidak menabrak batas waktu eksekusi Apps Script (6 menit).',
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (resp.getSelectedButton() !== ui.Button.OK) return;
-
-  var tabs = resp.getResponseText().split(',').map(function (t) {
-    return t.trim();
-  }).filter(Boolean);
-
-  if (!tabs.length) {
-    ui.alert('Tidak ada tab yang dimasukkan.');
-    return;
+  // Sudah bertanda persen di ujung -> seragamkan (hanya bila murni angka+%).
+  if (/^-?\d*\.?\d+\s*%$/.test(s)) {
+    var np = parseFloat(s.replace('%', '').replace(/,/g, '.').trim());
+    return isNaN(np) ? s : np.toFixed(2) + '%';
   }
 
-  var mulai = new Date().getTime();
+  // Rupiah: kolom IDR / insentif / amount.
+  var isRupiah = /_idr|insentif|amount|disbursement.*idr/i.test(nama);
+  if (isRupiah && /^-?\d+(\.\d+)?$/.test(s)) {
+    var rp = Math.round(parseFloat(s));
+    return 'Rp' + Number(rp).toLocaleString('id-ID');
+  }
+
+  // Count murni: Ranking, dan Disbursement NOA (target/capaian/gap berupa jumlah).
+  if (/ranking/i.test(nama)) return s;
+  if (/_noa\b/i.test(nama) && /target|capaian|gap/i.test(nama)) return s;
+
+  // Angka desimal -> persen bila rasio; angka besar dibiarkan.
+  if (/^-?\d*\.?\d+$/.test(s)) {
+    var n = parseFloat(s);
+    if (isNaN(n)) return s;
+    return (Math.abs(n) <= 3 ? n * 100 : n).toFixed(2) + '%';
+  }
+
+  return s;
+}
+
+/**
+ * Rapikan nama kolom KPI jadi label enak baca.
+ * "P01_Score_Repayment_Rate_DPD_0" -> "Score Repayment Rate DPD 0"
+ * "BOOST_Capaian_Mitra_Celengan_50K" -> "Boost Capaian Mitra Celengan 50K"
+ * Kolom meta identitas dikembalikan null (sudah dari DB_Employee/JWT).
+ */
+function labelKpi_(header) {
+  var h = String(header).trim();
+  var low = h.toLowerCase();
+
+  // Sudah tersedia dari DB_Employee / JWT.
+  if (['point', 'area', 'regional', 'pulau', 'nama', 'fullname'].indexOf(low) >= 0) return null;
+
+  // Buang prefix kode P01_/P02_/BOOM_/BOOST_, ganti underscore jadi spasi.
+  var t = h.replace(/^P\d+_/i, '').replace(/^BOOM_/i, 'Boom ').replace(/^BOOST_/i, 'Boost ');
+  t = t.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  return t;
+}
+
+// ─── Bangun record user ──────────────────────────────────────────────────────
+
+/**
+ * Kumpulkan semua karyawan (role yang dikirim) dengan periode terbaru sebagai
+ * data utama. Dipakai buildUsers_ dan juga sebagai bahan Team.gs (via
+ * bacaSemuaKaryawanProd_).
+ */
+function kumpulkanKaryawan_(rolesFilter, stats) {
+  var emp = bacaEmployee_();
+  var roles = rolesFilter || ['BP', 'BM', 'AM', 'RM'];
   var hasil = [];
 
-  tabs.forEach(function (tabName) {
-    // Sisakan margin sebelum batas 6 menit supaya hasil sebagian tetap
-    // tersimpan dan tidak hilang karena eksekusi dihentikan paksa.
-    if (new Date().getTime() - mulai > 4.5 * 60 * 1000) {
-      hasil.push('DILEWATI ' + tabName +
-        ': mendekati batas waktu. Jalankan tab ini terpisah.');
-      return;
-    }
-    try {
-      hasil.push(captureTab_(cfg.sourceId, tabName));
-    } catch (e) {
-      hasil.push('GAGAL ' + tabName + ': ' + e.message);
-    }
-  });
+  // Gating periode final. Bila diset (mis. "Week 1 - September 2026"), hanya
+  // snapshot periode itu ke bawah yang boleh dikirim — minggu lebih baru yang
+  // belum ditandai final diabaikan. Kosong = tanpa gating (pakai terbaru).
+  var finalLabel = periodeFinal_();
+  var finalKey = finalLabel ? parsePeriodeMingguan_(finalLabel).key : '';
 
-  var detik = Math.round((new Date().getTime() - mulai) / 1000);
-  hasil.push('\nWaktu eksekusi: ' + detik + ' detik.');
+  roles.forEach(function (role) {
+    var byNik = bacaPerf_(role);
+    var total = 0, terkirim = 0, skipNoEmp = 0, skipKosong = 0, skipBelumFinal = 0;
+    var contohNoEmp = [];
 
-  ui.alert('Hasil Capture', hasil.join('\n\n'), ui.ButtonSet.OK);
-}
+    Object.keys(byNik).forEach(function (nik) {
+      total++;
+      var u = byNik[nik];
+      var keys = Object.keys(u.snapshots).sort();   // sortable
+      if (!keys.length) { skipKosong++; return; }
 
-/**
- * Baca satu tab source, filter berdasar daftar point, tulis static values
- * ke tab arsip yang sesuai. Dedup by periode + NIK.
- */
-function captureTab_(sourceId, tabName) {
-  var src = SpreadsheetApp.openById(sourceId);
-  var sheet = src.getSheetByName(tabName);
-  if (!sheet) throw new Error('Tab "' + tabName + '" tidak ditemukan di source.');
-
-  var periode = parsePeriode_(tabName);
-  var role    = parseRole_(tabName);
-  var arsipName = arsipUntukRole_(role);
-
-  var lastRow = sheet.getLastRow();
-  var lastCol = sheet.getLastColumn();
-  if (lastRow < SOURCE_DATA_ROW) throw new Error('Tab "' + tabName + '" kosong.');
-
-  // getDisplayValues() -> ambil teks apa adanya (persen tetap "68.64%"),
-  // sekaligus memutus semua formula. Ini yang bikin arsip independen.
-  var headers = sheet.getRange(SOURCE_HEADER_ROW, 1, 1, lastCol)
-                     .getDisplayValues()[0];
-  var rows = sheet.getRange(SOURCE_DATA_ROW, 1, lastRow - SOURCE_DATA_ROW + 1, lastCol)
-                  .getDisplayValues();
-
-  // Peta kolom -> index. Kolom tanpa header (mis. kolom D) di-skip.
-  var colMap = {};
-  var usedCols = [];
-  headers.forEach(function (h, i) {
-    var clean = String(h).replace(/\s+/g, ' ').trim();
-    if (!clean) return;
-    // Kalau ada header duplikat, beri suffix biar tidak saling timpa.
-    var key = clean;
-    var n = 2;
-    while (colMap.hasOwnProperty(key)) { key = clean + ' (' + n + ')'; n++; }
-    colMap[key] = i;
-    usedCols.push(key);
-  });
-
-  var idxNik   = findCol_(colMap, KEY_NIK);
-  var idxNama  = findCol_(colMap, KEY_NAMA);
-  var idxPoint = findCol_(colMap, KEY_POINT);
-
-  if (idxNik === null) throw new Error('Kolom NIK tidak ditemukan di "' + tabName + '".');
-
-  // Point hanya ada di tab BP dan BM. AM memakai Area, RM memakai Regional
-  // sebagai satuan wilayah terkecil, jadi ketiadaan Point bukan error.
-  var punyaPoint = (idxPoint !== null);
-
-  var filterMap = bacaDaftarPoint_();
-
-  // Susun baris arsip: periode, role, kategori_point, lalu semua kolom source.
-  var arsipHeaders = ['periode', 'role', 'kategori_point'].concat(usedCols);
-
-  var daftarPoint = Object.keys(filterMap);
-
-  var out = [];
-  var mismatch = {};        // point mentah -> { jumlah, contoh NIK }
-  var kosongPoint = 0;
-  var jumlahBerkategori = 0;
-
-  rows.forEach(function (r) {
-    var nik = String(r[idxNik]).trim();
-    if (!nik) return;
-
-    // FILTER_AKTIF = false: semua karyawan diambil, daftar point hanya
-    // dipakai untuk menandai kategori. Baris tanpa point (AM/RM) atau yang
-    // point-nya di luar daftar tetap masuk arsip dengan kategori kosong.
-    var kategori = '';
-    if (punyaPoint) {
-      var pointRaw = String(r[idxPoint]).trim();
-      if (!pointRaw) {
-        kosongPoint++;
-      } else {
-        kategori = filterMap[normalizePoint_(pointRaw)] || '';
-        if (kategori) {
-          jumlahBerkategori++;
-        } else {
-          // Tetap dicatat sebagai informasi, bukan sebagai penolakan.
-          if (!mismatch[pointRaw]) mismatch[pointRaw] = { n: 0, niks: [] };
-          mismatch[pointRaw].n++;
-          if (mismatch[pointRaw].niks.length < 3) mismatch[pointRaw].niks.push(nik);
-        }
+      // Terapkan gating: buang snapshot yang lebih baru dari periode final.
+      if (finalKey) {
+        keys = keys.filter(function (k) { return k <= finalKey; });
+        if (!keys.length) { skipBelumFinal++; return; }
       }
-    }
 
-    if (FILTER_AKTIF && punyaPoint && !kategori) return;
-
-    var rec = [periode, role, kategori];
-    usedCols.forEach(function (k) { rec.push(r[colMap[k]]); });
-    out.push(rec);
-  });
-
-  var totalDiluarDaftar = Object.keys(mismatch).reduce(function (a, k) {
-    return a + mismatch[k].n;
-  }, 0);
-
-  // Log hanya relevan ketika filter aktif; saat nonaktif, "tidak cocok"
-  // adalah kondisi normal untuk mayoritas point nasional.
-  if (FILTER_AKTIF) {
-    catatMismatch_(periode, role, tabName, mismatch, daftarPoint);
-  }
-
-  if (!out.length) {
-    throw new Error('Tidak ada baris terbaca di "' + tabName +
-      '". Total baris source: ' + rows.length);
-  }
-
-  tulisArsip_(arsipName, arsipHeaders, out, periode, role);
-  catatConfig_(periode, role, tabName);
-
-  var ringkas = tabName + '\n  Periode: ' + periode + ' | Role: ' + role +
-                '\n  Tersimpan: ' + out.length + ' baris';
-  if (punyaPoint) {
-    ringkas += '\n  Berkategori (post_fraud / bottom_performance): ' + jumlahBerkategori +
-               '\n  Di luar daftar kategori: ' + totalDiluarDaftar;
-    if (kosongPoint) ringkas += '\n  Baris tanpa nama point: ' + kosongPoint;
-  } else {
-    ringkas += '\n  Tab ini tidak punya kolom Point — kategori dikosongkan.';
-  }
-  if (FILTER_AKTIF) {
-    ringkas += '\n  FILTER AKTIF: hanya point terdaftar yang disimpan.';
-  }
-
-  return ringkas;
-}
-
-/**
- * Catat setiap nama point yang tidak cocok ke tab log, lengkap dengan
- * kandidat terdekat dari daftar filter supaya beda ejaan mudah dikenali.
- */
-function catatMismatch_(periode, role, tabName, mismatch, daftarPoint) {
-  var sheet = sheetOrCreate_(LOG_SHEET);
-
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, 7).setValues([[
-      'waktu', 'periode', 'role', 'source_tab',
-      'nama_point_di_source', 'jumlah_baris', 'kandidat_mirip_di_daftar'
-    ]]).setFontWeight('bold');
-    sheet.setFrozenRows(1);
-    sheet.setColumnWidth(5, 220);
-    sheet.setColumnWidth(7, 300);
-  }
-
-  // Hapus baris log lama untuk periode+role ini supaya tidak menumpuk.
-  if (sheet.getLastRow() > 1) {
-    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getValues();
-    for (var i = data.length - 1; i >= 0; i--) {
-      if (String(data[i][1]) === periode && String(data[i][2]) === role) {
-        sheet.deleteRow(i + 2);
-      }
-    }
-  }
-
-  var keys = Object.keys(mismatch);
-  if (!keys.length) return;
-
-  var now = new Date();
-  var rows = keys.sort(function (a, b) {
-    return mismatch[b].n - mismatch[a].n;
-  }).map(function (p) {
-    return [
-      now, periode, role, tabName, p, mismatch[p].n,
-      cariKandidat_(p, daftarPoint)
-    ];
-  });
-
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
-}
-
-/**
- * Cari nama point di daftar filter yang paling mirip dengan nama di source.
- * Dipakai untuk membedakan "salah ketik" dari "memang di luar daftar".
- */
-function cariKandidat_(pointRaw, daftarPoint) {
-  var target = normalizePoint_(pointRaw);
-  var skor = [];
-
-  daftarPoint.forEach(function (kandidat) {
-    var d = jarakLevenshtein_(target, kandidat);
-    var maxLen = Math.max(target.length, kandidat.length) || 1;
-    var mirip = 1 - (d / maxLen);
-    if (mirip >= 0.6) skor.push({ nama: kandidat, mirip: mirip });
-  });
-
-  if (!skor.length) return 'tidak ada yang mirip — kemungkinan memang di luar daftar';
-
-  skor.sort(function (a, b) { return b.mirip - a.mirip; });
-  return skor.slice(0, 3).map(function (s) {
-    return s.nama + ' (' + Math.round(s.mirip * 100) + '%)';
-  }).join('  |  ');
-}
-
-/** Jarak edit antara dua string. */
-function jarakLevenshtein_(a, b) {
-  if (a === b) return 0;
-  if (!a.length) return b.length;
-  if (!b.length) return a.length;
-
-  var prev = [];
-  for (var j = 0; j <= b.length; j++) prev[j] = j;
-
-  for (var i = 1; i <= a.length; i++) {
-    var cur = [i];
-    for (var k = 1; k <= b.length; k++) {
-      var cost = a.charAt(i - 1) === b.charAt(k - 1) ? 0 : 1;
-      cur[k] = Math.min(cur[k - 1] + 1, prev[k] + 1, prev[k - 1] + cost);
-    }
-    prev = cur;
-  }
-  return prev[b.length];
-}
-
-/**
- * Tulis ke tab arsip. Kalau periode+role sudah ada, baris lama dihapus
- * dulu supaya capture ulang bersifat replace, bukan duplikat.
- */
-function tulisArsip_(arsipName, headers, rows, periode, role) {
-  var sheet = sheetOrCreate_(arsipName);
-
-  // Urutan kolom apa adanya dari capture ini. Disimpan sebelum 'headers'
-  // berpotensi di-merge dengan header lama di bawah.
-  var capturedOrder = headers.slice();
-
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
-    sheet.setFrozenRows(1);
-  } else {
-    // Header source bisa bertambah kolom antar bulan. Kalau beda, perluas.
-    var existing = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    var merged = existing.slice();
-    headers.forEach(function (h) {
-      if (merged.indexOf(h) === -1) merged.push(h);
-    });
-    if (merged.length !== existing.length) {
-      sheet.getRange(1, 1, 1, merged.length).setValues([merged]).setFontWeight('bold');
-    }
-    headers = merged;
-  }
-
-  var headerNow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-
-  // Hapus baris lama untuk periode+role ini.
-  if (sheet.getLastRow() > 1) {
-    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    var iPer = headerNow.indexOf('periode');
-    var iRol = headerNow.indexOf('role');
-    for (var i = data.length - 1; i >= 0; i--) {
-      if (String(data[i][iPer]) === periode && String(data[i][iRol]) === role) {
-        sheet.deleteRow(i + 2);
-      }
-    }
-  }
-
-  // Petakan tiap baris ke urutan header aktual di sheet. Kolom yang tidak
-  // ada di capture ini diisi kosong, jadi bulan dengan jumlah kolom berbeda
-  // tetap sejajar.
-  var aligned = rows.map(function (r) {
-    var map = {};
-    capturedOrder.forEach(function (h, i) { map[h] = r[i]; });
-    return headerNow.map(function (h) {
-      return map.hasOwnProperty(h) ? map[h] : '';
-    });
-  });
-
-  sheet.getRange(sheet.getLastRow() + 1, 1, aligned.length, headerNow.length)
-       .setValues(aligned);
-}
-
-function catatConfig_(periode, role, sourceTab) {
-  var sheet = sheetOrCreate_(CONFIG_SHEET);
-  var now = new Date();
-
-  if (sheet.getLastRow() > 1) {
-    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getValues();
-    for (var i = 0; i < data.length; i++) {
-      if (String(data[i][0]) === periode && String(data[i][1]) === role) {
-        sheet.getRange(i + 2, 3, 1, 2).setValues([[sourceTab, now]]);
+      // Wilayah = acuan penempatan terupdate dari DB_Employee. Karyawan yang
+      // tidak ada di DB_Employee non-HO (termasuk HO yang sudah dibuang, atau
+      // NIK tak terdaftar) tidak dikirim — tidak punya penempatan valid.
+      var w = emp[nik];
+      if (!w) {
+        skipNoEmp++;
+        if (contohNoEmp.length < 5) contohNoEmp.push(nik + (u.nama ? ' (' + u.nama + ')' : ''));
         return;
       }
-    }
-  }
-  sheet.appendRow([periode, role, sourceTab, now]);
-}
 
-// ─── Daftar point (filter) ──────────────────────────────────────────────────
+      var latest = keys[keys.length - 1];
+      var snap = u.snapshots[latest];
 
-/**
- * Baca kedua tab filter, kembalikan map: normalized_point -> kategori.
- * Kalau satu point ada di dua daftar, kategorinya digabung.
- */
-function bacaDaftarPoint_() {
-  var map = {};
-
-  Object.keys(FILTER_SHEETS).forEach(function (kategori) {
-    var name = FILTER_SHEETS[kategori];
-    var sheet = ss_().getSheetByName(name);
-    if (!sheet || sheet.getLastRow() === 0) return;
-
-    var values = sheet.getRange(1, 1, sheet.getLastRow(), 1).getDisplayValues();
-    values.forEach(function (row) {
-      var v = String(row[0]).trim();
-      if (!v) return;
-      // Lewati kemungkinan baris header.
-      if (/^(point|nama point|cabang)$/i.test(v)) return;
-
-      var key = normalizePoint_(v);
-      map[key] = map[key] ? (map[key] + ',' + kategori) : kategori;
-    });
-  });
-
-  return map;
-}
-
-/** Normalisasi nama point supaya "01 Kembaran" == "01  kembaran". */
-function normalizePoint_(s) {
-  return String(s).toLowerCase().replace(/\s+/g, ' ').trim();
-}
-
-// ─── Agregat per point ──────────────────────────────────────────────────────
-
-function hitungAgregat() {
-  var hasil = [];
-  // Hanya BP dan BM yang punya kolom Point. AM beroperasi di level Area
-  // dan RM di level Regional, sehingga tidak bisa diagregasi per point.
-  [{ sheet: ARSIP_BP, role: 'BP' }, { sheet: ARSIP_BM, role: 'BM' }]
-    .forEach(function (cfg) {
-      hasil = hasil.concat(agregatDariArsip_(cfg.sheet));
+      hasil.push({
+        nik: nik,
+        nama: u.nama,
+        role: role,
+        position: w.position || '',
+        point: w.point || '',
+        area: w.area || '',
+        regional: w.regional || '',
+        pulau: w.pulau || '',
+        periodeKey: latest,
+        periodeLabel: snap.label,
+        kpi: snap.kpi,
+        skor: skorKeSkala_(snap.kpi['Skor_KPI']),
+        snapshots: u.snapshots
+      });
+      terkirim++;
     });
 
-  var sheet = sheetOrCreate_(AGREGAT_POINT);
-  if (sheet.getLastRow() > 1) {
-    sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
-  }
-
-  if (!hasil.length) {
-    SpreadsheetApp.getUi().alert('Belum ada data arsip untuk diagregasi.');
-    return;
-  }
-
-  sheet.getRange(2, 1, hasil.length, hasil[0].length).setValues(hasil);
-  ss_().toast(hasil.length + ' baris agregat dihitung.', 'FO Performance');
-}
-
-function agregatDariArsip_(arsipName) {
-  var sheet = ss_().getSheetByName(arsipName);
-  if (!sheet || sheet.getLastRow() < 2) return [];
-
-  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-  var iPer   = headers.indexOf('periode');
-  var iRole  = headers.indexOf('role');
-  var iKat   = headers.indexOf('kategori_point');
-  var iPoint = findColIdx_(headers, KEY_POINT);
-  var iSkor  = findColIdx_(headers, 'total skor kpi');
-  var iBoom  = findColIdx_(headers, 'kena boom');
-  var iBoost = findColIdx_(headers, 'dapat boost');
-  var iParam = findColIdx_(headers, 'parameter yang belum tercapai');
-
-  var groups = {};
-  data.forEach(function (r) {
-    var key = r[iPer] + '||' + String(r[iPoint]).trim() + '||' + r[iRole];
-    if (!groups[key]) {
-      groups[key] = {
-        periode: r[iPer], point: String(r[iPoint]).trim(), role: r[iRole],
-        kategori: r[iKat], skor: [], boom: 0, boost: 0, params: {}
-      };
-    }
-    var g = groups[key];
-
-    if (iSkor >= 0) {
-      var v = skorKeSkala_(r[iSkor]);
-      if (v !== null) g.skor.push(v);
-    }
-    if (iBoom >= 0 && /^ya|yes$/i.test(String(r[iBoom]).trim())) g.boom++;
-    if (iBoost >= 0 && /^ya|yes$/i.test(String(r[iBoost]).trim())) g.boost++;
-    if (iParam >= 0) {
-      String(r[iParam]).split(',').forEach(function (p) {
-        var t = p.trim();
-        if (!t || /^semua parameter belum tercapai$/i.test(t)) return;
-        g.params[t] = (g.params[t] || 0) + 1;
+    if (stats) {
+      stats.push({
+        role: role,
+        dikirim: roleDikirim_(role),
+        total: total,
+        lolos: terkirim,
+        skip_no_employee: skipNoEmp,
+        skip_tanpa_periode: skipKosong,
+        skip_belum_final: skipBelumFinal,
+        contoh_no_employee: contohNoEmp
       });
     }
   });
 
-  var now = new Date();
-  return Object.keys(groups).map(function (k) {
-    var g = groups[k];
-    var avg = g.skor.length
-      ? (g.skor.reduce(function (a, b) { return a + b; }, 0) / g.skor.length)
-      : '';
+  return hasil;
+}
 
-    var topParam = '';
-    var max = 0;
-    Object.keys(g.params).forEach(function (p) {
-      if (g.params[p] > max) { max = g.params[p]; topParam = p; }
+/** Skor ke skala 0-100 apa pun formatnya (untuk ringkasan tim). */
+function skorKeSkala_(v) {
+  if (v === '' || v === null || v === undefined) return null;
+  var s = String(v).trim();
+  var ada = /%$/.test(s);
+  var n = parseFloat(s.replace('%', '').replace(/,/g, '.').trim());
+  if (isNaN(n)) return null;
+  if (ada) return n;
+  return (Math.abs(n) <= 3) ? n * 100 : n;
+}
+
+/** Payload users untuk backend (hanya role yang dikirim). */
+function buildUsers_(ringkasan, stats) {
+  var rolesKirim = ['BP', 'BM', 'AM', 'RM'].filter(roleDikirim_);
+  var karyawan = kumpulkanKaryawan_(rolesKirim, stats);
+  var timPerNik = (ringkasan && ringkasan.perNik) ? ringkasan.perNik : {};
+
+  return karyawan.map(function (k) {
+    var rec = {
+      username: k.nik,
+      full_name: k.nama,
+      role: k.role,
+      position: k.position,
+      periode_kpi: k.periodeLabel,
+      point: k.point,
+      area: k.area,
+      regional: k.regional,
+      pulau: k.pulau
+    };
+
+    // KPI periode terbaru.
+    Object.keys(k.kpi).forEach(function (kolom) {
+      if (kolomDisembunyikan_(kolom)) return;
+      var label = labelKpi_(kolom);
+      if (!label) return;
+      rec[label] = normalisasiNilai_(k.kpi[kolom], kolom);
     });
-    if (topParam) topParam += ' (' + max + ' org)';
 
-    return [
-      g.periode, g.point, g.role,
-      g.skor.length ? g.skor.length : 0,
-      avg === '' ? '' : (avg.toFixed(2) + '%'),
-      g.boom, g.boost, topParam, g.kategori, now
-    ];
+    // Riwayat minggu lama (bila diaktifkan).
+    if (kirimRiwayat_()) {
+      var keys = Object.keys(k.snapshots).sort();
+      var older = keys.slice(0, -1).slice(-RIWAYAT_MINGGU);
+      older.forEach(function (pk) {
+        var snap = k.snapshots[pk];
+        RIWAYAT_KOLOM.forEach(function (kolom) {
+          if (snap.kpi[kolom] === undefined || snap.kpi[kolom] === '') return;
+          if (kolomDisembunyikan_(kolom)) return;
+          rec['Riwayat ' + snap.label + ' - ' + labelKpi_(kolom)] =
+            normalisasiNilai_(snap.kpi[kolom], kolom);
+        });
+      });
+    }
+
+    // Ringkasan tim bila user ini atasan.
+    var tim = timPerNik[k.nik];
+    if (tim) Object.keys(tim).forEach(function (kk) { rec[kk] = tim[kk]; });
+
+    return rec;
   });
 }
 
-// ─── doGet: serve JSON ke FastAPI ───────────────────────────────────────────
+/**
+ * Bahan untuk Team.gs: semua karyawan (semua role, tanpa filter kirim) dengan
+ * wilayah dan skor. Team.gs butuh lihat seluruh hierarki walau yang dikirim
+ * hanya sebagian role.
+ */
+function bacaSemuaKaryawanProd_() {
+  return kumpulkanKaryawan_(['BP', 'BM', 'AM', 'RM']).map(function (k) {
+    return {
+      nik: k.nik, nama: k.nama, role: k.role,
+      point: k.point, area: k.area, regional: k.regional, pulau: k.pulau,
+      skor: k.skor, kpi: k.kpi
+    };
+  });
+}
+
+// ─── doGet ───────────────────────────────────────────────────────────────────
 
 function doGet(e) {
+  // Routing: request backend (ada token) -> JSON. Selain itu -> command center.
+  var params = (e && e.parameter) || {};
+  if (params.token || params.scope) {
+    return doGetData_(e);
+  }
+  // Halaman command center.
+  return HtmlService.createHtmlOutputFromFile('CommandCenter')
+    .setTitle('FO KPI Command Center')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// ─── API dipanggil dari halaman (google.script.run) ──────────────────────────
+
+function cc_login(password) {
+  return { ok: cekPassword_(password) };
+}
+
+/** Ambil semua yang dibutuhkan halaman: config saat ini + daftar periode. */
+function cc_getStatus(password) {
+  if (!cekPassword_(password)) return { error: 'unauthorized' };
+  var periode = daftarPeriode_();
+  var cfg = getKonfig_();
+  // kelengkapan untuk periode terbaru & yang dipilih final
+  var lengkapTerbaru = periode.length ? kelengkapanPeriode_(periode[0].label) : {};
+  var lengkapFinal = cfg.periode_final ? kelengkapanPeriode_(cfg.periode_final) : {};
+  return {
+    ok: true,
+    config: cfg,
+    periode: periode,
+    kelengkapan_terbaru: lengkapTerbaru,
+    kelengkapan_final: lengkapFinal
+  };
+}
+
+/** Simpan config dari halaman. patch = objek {key: value}. */
+function cc_saveConfig(password, patch) {
+  if (!cekPassword_(password)) return { error: 'unauthorized' };
+  var diubah = [];
+  Object.keys(patch || {}).forEach(function (k) {
+    if (DEFAULT_CONFIG.hasOwnProperty(k)) {
+      setKonfig_(k, String(patch[k]));
+      diubah.push(k);
+    }
+  });
+  catatLog_('commandCenter', 'CONFIG_UPDATE', 'diubah: ' + diubah.join(', '), {});
+  return { ok: true, diubah: diubah, config: getKonfig_() };
+}
+
+/** Cek kelengkapan satu periode (dipanggil saat user pilih di dropdown). */
+function cc_cekKelengkapan(password, label) {
+  if (!cekPassword_(password)) return { error: 'unauthorized' };
+  return { ok: true, label: label, kelengkapan: kelengkapanPeriode_(label) };
+}
+
+// ─── doGet data (backend) ────────────────────────────────────────────────────
+
+function doGetData_(e) {
   var cfg = getConfig_();
   var token = (e && e.parameter && e.parameter.token) || '';
   if (cfg.syncToken && token !== cfg.syncToken) {
+    catatLog_('doGet', 'DITOLAK', 'token tidak valid', {});
     return ContentService
       .createTextOutput(JSON.stringify({ error: 'unauthorized' }))
       .setMimeType(ContentService.MimeType.JSON);
@@ -738,36 +661,100 @@ function doGet(e) {
   if (limit > 2000) limit = 2000;
 
   var out = { page: page, limit: limit };
+  var mulai = new Date().getTime();
 
-  if (scope === 'users' || scope === 'all') {
-    var ringkasan = RINGKASAN_TIM_AKTIF ? ringkasanTimPerNik_() : null;
-    var allUsers = buildUsersFull_(ringkasan);
-    out.users = potongPage_(allUsers, page, limit);
-    out.users_total = allUsers.length;
+  try {
+    var statsUser = [];
+    if (scope === 'users' || scope === 'all') {
+      var ringkasan = cfgRingkasanTimAktif_()
+        ? ringkasanTimPerNik_() : null;
+      var allUsers = buildUsersFull_(ringkasan, statsUser);
+      out.users = potongPage_(allUsers, page, limit);
+      out.users_total = allUsers.length;
+    }
+
+    if (scope === 'branches' || scope === 'all') {
+      var allBranches = buildBranchesFull_();
+      out.branches = potongPage_(allBranches, page, limit);
+      out.branches_total = allBranches.length;
+    }
+
+    out.row_count = (out.users_total || 0) + (out.branches_total || 0);
+
+    // Catat log hanya di halaman pertama supaya tidak menumpuk saat paginasi.
+    if (page === 1) {
+      var durasi = ((new Date().getTime() - mulai) / 1000).toFixed(1) + 's';
+      catatLog_('doGet', 'BERHASIL',
+        'scope=' + scope + ' | users=' + (out.users_total || 0) +
+        ' branches=' + (out.branches_total || 0) + ' | ' + durasi,
+        { stats: statsUser });
+    }
+
+    return ContentService
+      .createTextOutput(JSON.stringify(out))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    catatLog_('doGet', 'GAGAL', String(err && err.message ? err.message : err), {});
+    return ContentService
+      .createTextOutput(JSON.stringify({ error: String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
   }
-
-  if (scope === 'branches' || scope === 'all') {
-    var allBranches = buildBranchesFull_();
-    out.branches = potongPage_(allBranches, page, limit);
-    out.branches_total = allBranches.length;
-  }
-
-  out.row_count = (out.users_total || 0) + (out.branches_total || 0);
-  return ContentService
-    .createTextOutput(JSON.stringify(out))
-    .setMimeType(ContentService.MimeType.JSON);
 }
 
+/**
+ * Catat satu baris ke tab "Log Sync". Kolom: waktu, sumber, status, ringkasan,
+ * lalu per-role detail (dikirim/lolos/skip) supaya mudah ditelusuri.
+ * Menyimpan maksimal ~500 baris terakhir agar tidak membengkak.
+ */
+function catatLog_(sumber, status, ringkasan, extra) {
+  try {
+    var sheet = sheetOrCreate_('Log Sync');
+    if (sheet.getLastRow() === 0) {
+      sheet.getRange(1, 1, 1, 5).setValues([[
+        'waktu', 'sumber', 'status', 'ringkasan', 'detail_per_role'
+      ]]).setFontWeight('bold');
+      sheet.setFrozenRows(1);
+      sheet.setColumnWidth(4, 320);
+      sheet.setColumnWidth(5, 500);
+    }
+
+    var detail = '';
+    if (extra && extra.stats && extra.stats.length) {
+      detail = extra.stats.map(function (s) {
+        var t = s.role + (s.dikirim ? '[kirim]' : '[tahan]') +
+                ': lolos ' + s.lolos + '/' + s.total;
+        if (s.skip_no_employee) {
+          t += ', skip ' + s.skip_no_employee + ' (tak ada di DB_Employee';
+          if (s.contoh_no_employee && s.contoh_no_employee.length) {
+            t += ': ' + s.contoh_no_employee.join(', ');
+          }
+          t += ')';
+        }
+        if (s.skip_tanpa_periode) t += ', skip ' + s.skip_tanpa_periode + ' (tanpa periode)';
+        return t;
+      }).join('  |  ');
+    }
+
+    sheet.appendRow([new Date(), sumber, status, ringkasan, detail]);
+
+    // Pangkas kalau lebih dari 500 baris data (+1 header).
+    var maxRows = 501;
+    if (sheet.getLastRow() > maxRows) {
+      sheet.deleteRows(2, sheet.getLastRow() - maxRows);
+    }
+  } catch (e) {
+    // Log gagal tidak boleh menggagalkan sync. Diamkan.
+  }
+}
 
 function potongPage_(arr, page, limit) {
   var mulai = (page - 1) * limit;
   return arr.slice(mulai, mulai + limit);
 }
 
-function buildUsersFull_(ringkasan) {
-  var branches = []; // tidak dipakai, hanya untuk reuse
-  var bcp = {};
-  var users = buildUsers_(ringkasan);
+function buildUsersFull_(ringkasan, stats) {
+  var users = buildUsers_(ringkasan, stats);
   if (ringkasan && ringkasan.semua) {
     var hmbUsers = buildHmbUsers_(ringkasan.semua, ringkasan.regToPulau);
     users = users.concat(hmbUsers);
@@ -775,434 +762,156 @@ function buildUsersFull_(ringkasan) {
   return users;
 }
 
-// Isi lama doGet() untuk branches dipindah ke sini tanpa diubah.
 function buildBranchesFull_() {
-  var branches = BCP_CONFIG.kirimAgregatKpi ? buildBranches_() : [];
-  var bcp = buildBcpBranches_();
-  var byPoint = {};
-  branches.forEach(function (b) { byPoint[b.point] = b; });
-  Object.keys(bcp).forEach(function (point) {
-    if (!byPoint[point]) byPoint[point] = { point: point, nama_cabang: point };
-    var rec = bcp[point];
-    Object.keys(rec).forEach(function (k) { byPoint[point][k] = rec[k]; });
-  });
-  return Object.keys(byPoint).map(function (p) { return byPoint[p]; });
+  // Agregat point per BP/BM. BCP sudah tidak dipakai.
+  if (!get_KIRIM_AGREGAT_POINT_()) return [];
+  return buildBranches_();
 }
 
+// ─── Agregat point (dari data PROD, per point untuk BP/BM) ────────────────────
+
 /**
- * Satu objek per NIK. Struktur sudah future-proof: 'riwayat' siap diisi
- * periode terbaru jadi data utama; bulan lama jadi rangkuman riwayat.
+ * Agregat per point dari karyawan BP & BM periode terbaru: jumlah, rata-rata
+ * skor per role, jumlah kena boom, dapat boost. Dipakai buildBranchesFull_.
  */
-function buildUsers_(ringkasan) {
-  var byNik = {};
-  var targetPeriode = getPeriodeTarget_();
-  SEMUA_ARSIP.forEach(function (arsipName) {
-    var sheet = ss_().getSheetByName(arsipName);
-    if (!sheet || sheet.getLastRow() < 2) return;
-    var roleArsip = arsipName.replace(/^Arsip\s+/i, '').trim().toUpperCase();
-    if (!roleDikirim_(roleArsip)) return;
-    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    var iPer  = headers.indexOf('periode');
-    var iNik  = findColIdx_(headers, KEY_NIK);
-    var iNama = findColIdx_(headers, KEY_NAMA);
-    if (iNik < 0 || iPer < 0) return;
-    var adaTarget = data.some(function (r) { 
-      return formatPeriodeCell_(r[iPer]) === targetPeriode; 
-    });
-    var latest = '';
-    if (!adaTarget) {
-      data.forEach(function (r) {
-        var p = formatPeriodeCell_(r[iPer]);
-        if (p > latest) latest = p;
-      });
+function buildBranches_() {
+  var karyawan = kumpulkanKaryawan_(['BP', 'BM']);
+  var perPoint = {};
+
+  karyawan.forEach(function (k) {
+    if (!k.point) return;
+    if (!perPoint[k.point]) {
+      perPoint[k.point] = { point: k.point, nama_cabang: k.point, orang: [] };
     }
-    var periodeDipakai = adaTarget ? targetPeriode : latest;
-    data.forEach(function (r) {
-      var periode = formatPeriodeCell_(r[iPer]);
-      if (periode !== periodeDipakai) return;
-      var nik = String(r[iNik]).trim();
-      if (!nik) return;
-      var kpi = {};
-      var skip = [iPer, iNik, iNama];
-      headers.forEach(function (h, i) {
-        if (skip.indexOf(i) >= 0 || !h) return;
-        var v = r[i];
-        if (v === '' || v === null) return;
-        kpi[h] = v;
-      });
-      byNik[nik] = {
-        nik: nik,
-        nama: String(r[iNama] || '').trim(),
-        periode: periode,
-        kpi: kpi
-      };
-    });
+    perPoint[k.point].orang.push(k);
   });
-  // Gunakan ringkasan yang sudah dioper dari doGet
-  var timPerNik = (ringkasan && ringkasan.perNik) ? ringkasan.perNik : {};
-  return Object.keys(byNik).map(function (nik) {
-    var u = byNik[nik];
-    var rec = {
-      username: nik,
-      full_name: u.nama,
-      periode_kpi: u.periode || ''
-    };
-    Object.keys(u.kpi).forEach(function (h) {
-      var v = u.kpi[h];
-      if (v === '' || v === null || v === undefined) return;
-      if (kolomDisembunyikan_(h)) return;
-      var label = labelKpi_(h);
-      if (!label) return;
-      rec[label] = normalisasiNilai_(v, h);
+
+  return Object.keys(perPoint).map(function (p) {
+    var blok = perPoint[p];
+    var rec = { point: blok.point, nama_cabang: blok.nama_cabang };
+
+    ['BP', 'BM'].forEach(function (role) {
+      var arr = blok.orang.filter(function (o) { return o.role === role; });
+      if (!arr.length) return;
+      rec['Point Jumlah ' + role] = arr.length;
+      var skor = arr.filter(function (o) { return o.skor !== null; })
+                    .map(function (o) { return o.skor; });
+      if (skor.length) {
+        var avg = skor.reduce(function (a, b) { return a + b; }, 0) / skor.length;
+        rec['Point Rata-rata Skor ' + role] = avg.toFixed(2) + '%';
+      }
+      rec['Point Kena Boom ' + role] = arr.filter(function (o) {
+        return /^ya|yes$/i.test(String(o.kpi['Boom'] || '').trim());
+      }).length;
+      rec['Point Dapat Boost ' + role] = arr.filter(function (o) {
+        return /^ya|yes$/i.test(String(o.kpi['Boost'] || '').trim());
+      }).length;
     });
-    if (rec['Kategori Point'] === '' || rec['Kategori Point'] === undefined) {
-      delete rec['Kategori Point'];
-    }
-    var tim = timPerNik[nik];
-    if (tim) {
-      Object.keys(tim).forEach(function (k) { rec[k] = tim[k]; });
-    }
+
     return rec;
   });
 }
 
-/**
- * Rapikan nilai supaya konsisten dan tidak ambigu.
- *
- * Persentase ditulis dengan simbol % dan dua desimal tetap. Pencegahan
- * salah tafsir (54.40% dibaca sebagai 0.544) ditangani lewat aturan
- * penulisan di KB, bukan dengan mengubah simbolnya.
- *
- * Rupiah diberi pemisah ribuan agar tidak terbaca sebagai angka polos.
- */
-function normalisasiNilai_(v, namaKolom) {
-  var s = String(v).trim();
-  if (!s) return s;
-  var nama = String(namaKolom || '');
-  if (/%$/.test(s)) {
-    if (/[\-\/]/.test(s) && (s.match(/%/g) || []).length > 1) return s;
-    var angka = s.replace(/%/g, '').replace(/,/g, '.').trim();
-    var np = parseFloat(angka);
-    if (!isNaN(np)) return np.toFixed(2) + '%';
-    return s;
-  }
-  var sClean = s.replace(/,/g, '.');
-  var scoreDsb = /score|skor|^gap to target %|cohort|grouping|pencapaian|growth|quality|celengan|ppob/i.test(nama);
-  var pastiPersen = scoreDsb ||
-                    /%|rate|renewal|repayment|achievement|majelis anggota|celengan|ppob|profit|flow rate|retention|audit rating/i.test(nama);
-  var hitungan = !scoreDsb && (
-                   /rangking|nik|rank|jumlah|cek double/i.test(nama) ||
-                   /^(target |gap to target )?new majelis cair per bulan$/i.test(nama)
-                 );
-  if (!hitungan && /^-?\d*\.?\d+$/.test(sClean)) {
-    var n = parseFloat(sClean);
-    if (!isNaN(n)) {
-      var isDecimalRatio = sClean.indexOf('.') >= 0 && Math.abs(n) <= 10;
-      if (pastiPersen || isDecimalRatio) {
-        var persen = (Math.abs(n) <= 10) ? n * 100 : n;
-        return persen.toFixed(2) + '%';
-      }
-    }
-  }
-  var isRupiah = /insentif|amount|disbursement|lost|recovery|collect/i.test(nama);
-  if (isRupiah && /^-?\d+$/.test(sClean)) {
-    return 'Rp' + Number(sClean).toLocaleString('id-ID');
-  }
-  if (!nama && /^-?\d{7,}$/.test(sClean)) {
-    return 'Rp' + Number(sClean).toLocaleString('id-ID');
-  }
-  return s;
-}
+// ─── Menu ────────────────────────────────────────────────────────────────────
 
-function labelKpi_(header) {
-  var h = String(header).replace(/\s+/g, ' ').trim();
-
-  // Sudah ada di user_context dari JWT — jangan diulang.
-  if (['Point', 'Area', 'Regional', 'Nama'].indexOf(h) >= 0) return null;
-
-  if (h === 'Jabatan' || h === 'Pulau') return h;
-  if (h === 'role') return 'Role';
-  if (h === 'kategori_point') return 'Kategori Point';
-
-  // Backend sudah memberi tag pada blok metrik, jadi prefix "KPI" di tiap
-  // baris menjadi mubazir ("KPI Total Skor KPI"). Kolom dipakai apa adanya.
-  return h;
-}
-
-/** Satu objek per point, dari tab Agregat Point (periode terbaru saja). */
-function buildBranches_() {
-  var sheet = ss_().getSheetByName(AGREGAT_POINT);
-  if (!sheet || sheet.getLastRow() < 2) return [];
-
-  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-  var iPer = headers.indexOf('periode');
-  var iPoint = headers.indexOf('point');
-  var iRole = headers.indexOf('role');
-
-  var targetPeriode = getPeriodeTarget_();
-  var adaTarget = data.some(function (r) { 
-    return formatPeriodeCell_(r[iPer]) === targetPeriode; 
-  });
-  var latest = '';
-  if (!adaTarget) {
-    data.forEach(function (r) {
-      var p = formatPeriodeCell_(r[iPer]);
-      if (p > latest) latest = p;
-    });
-  }
-  var periodeDipakai = adaTarget ? targetPeriode : latest;
-
-  var byPoint = {};
-  data.forEach(function (r) {
-    if (formatPeriodeCell_(r[iPer]) !== periodeDipakai) return;
-    var point = String(r[iPoint]).trim();
-    if (!point) return;
-
-    if (!byPoint[point]) {
-      byPoint[point] = { point: point, nama_cabang: point, periode_kpi: periodeDipakai };
-    }
-
-    var role = String(r[iRole]).trim();
-    headers.forEach(function (h, i) {
-      if (i === iPer || i === iPoint || i === iRole || !h) return;
-      if (r[i] === '' || r[i] === null) return;
-      var label = String(h).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
-      if (kolomDisembunyikan_(label)) return;
-      byPoint[point]['Point ' + role + ' - ' + label] = normalisasiNilai_(r[i], label);
-    });
-  });
-
-  return Object.keys(byPoint).map(function (p) { return byPoint[p]; });
-}
-
-// ─── Utilities ──────────────────────────────────────────────────────────────
-
-/**
- * Cari index kolom di colMap. Exact match diprioritaskan supaya 'point'
- * tidak tertangkap oleh header lain yang kebetulan mengandung kata itu.
- */
-function findCol_(colMap, needle) {
-  var keys = Object.keys(colMap);
-  var n = needle.toLowerCase();
-  for (var i = 0; i < keys.length; i++) {
-    if (keys[i].toLowerCase().trim() === n) return colMap[keys[i]];
-  }
-  for (var j = 0; j < keys.length; j++) {
-    if (keys[j].toLowerCase().indexOf(n) >= 0) return colMap[keys[j]];
-  }
-  return null;
-}
-
-/**
- * Cari index kolom. Exact match diprioritaskan agar 'point' tidak salah
- * menangkap 'kategori_point', dan 'nama' tidak menangkap 'nama_cabang'.
- */
-function findColIdx_(headers, needle) {
-  var n = needle.toLowerCase();
-  for (var i = 0; i < headers.length; i++) {
-    if (String(headers[i]).toLowerCase().replace(/\s+/g, ' ').trim() === n) return i;
-  }
-  for (var j = 0; j < headers.length; j++) {
-    if (String(headers[j]).toLowerCase().indexOf(n) >= 0) return j;
-  }
-  return -1;
-}
-
-/** "Jul - BP" -> "2026-07". Tahun diambil dari nama file source bila ada. */
-/** "2026-07" -> "Juli 2026". Untuk label riwayat yang enak dibaca. */
-function namaPeriode_(p) {
-  var nama = {
-    '01': 'Januari', '02': 'Februari', '03': 'Maret', '04': 'April',
-    '05': 'Mei', '06': 'Juni', '07': 'Juli', '08': 'Agustus',
-    '09': 'September', '10': 'Oktober', '11': 'November', '12': 'Desember'
-  };
-  var m = String(p).match(/^(\d{4})-(\d{2})$/);
-  if (!m) return String(p);
-  return (nama[m[2]] || m[2]) + ' ' + m[1];
-}
-
-function parsePeriode_(tabName) {
-  var lower = tabName.toLowerCase();
-  var bulan = '';
-  Object.keys(MONTH_NAMES).forEach(function (m) {
-    if (!bulan && lower.indexOf(m) >= 0) bulan = MONTH_NAMES[m];
-  });
-  if (!bulan) bulan = '00';
-
-  var tahun = String(new Date().getFullYear());
-  var cfg = getConfig_();
-  if (cfg.sourceId) {
-    try {
-      var nama = SpreadsheetApp.openById(cfg.sourceId).getName();
-      var m = nama.match(/20\d{2}/);
-      if (m) tahun = m[0];
-    } catch (e) { /* fallback ke tahun berjalan */ }
-  }
-  return tahun + '-' + bulan;
-}
-
-/** "Jul - BM" -> "BM". Default BP. */
-function parseRole_(tabName) {
-  var t = tabName.toUpperCase();
-  if (/\bBM\b/.test(t)) return 'BM';
-  if (/\bAM\b/.test(t)) return 'AM';
-  if (/\bRM\b/.test(t)) return 'RM';
-  return 'BP';
-}
-
-/** "68.64%" -> 68.64 ; "" -> null */
-function parsePersen_(v) {
-  return skorKeSkala_(v);
-}
-
-/**
- * Samakan skor ke skala persen 0–100 apa pun format sumbernya
- * ("61.22%", "0.6122", atau "61.22"). Dipakai untuk agregat point.
- */
-
-function skorKeSkala_(v) {
-  if (v === '' || v === null || v === undefined) return null;
-  var s = String(v).trim();
-  var adaPersen = /%$/.test(s);
-  var n = parseFloat(s.replace(/%/g, '').replace(/,/g, '.').trim());
-  if (isNaN(n)) return null;
-  if (adaPersen) return n;
-  return (Math.abs(n) <= 10) ? n * 100 : n;
-}
-
-
-// ─── Ringkasan & audit ──────────────────────────────────────────────────────
-
-/**
- * Bandingkan daftar point di tab filter dengan point yang benar-benar
- * muncul di source. Menjawab dua pertanyaan sekaligus:
- *   - point mana di daftar lu yang tidak punya satu pun karyawan di source
- *   - point mana di source yang tidak ada di daftar lu
- */
-function auditDaftarPoint() {
-  var cfg = getConfig_();
+function onOpen() {
   var ui = SpreadsheetApp.getUi();
-
-  if (!cfg.sourceId) {
-    ui.alert('SOURCE_SPREADSHEET_ID belum diisi di Script Properties.');
-    return;
-  }
-
-  var resp = ui.prompt(
-    'Audit Daftar Point',
-    'Masukkan nama tab source yang mau dicek, pisahkan koma.\n' +
-    'Contoh: Jul - BP, Jul - BM',
-    ui.ButtonSet.OK_CANCEL
-  );
-  if (resp.getSelectedButton() !== ui.Button.OK) return;
-
-  var tabs = resp.getResponseText().split(',').map(function (t) {
-    return t.trim();
-  }).filter(Boolean);
-  if (!tabs.length) return;
-
-  var filterMap = bacaDaftarPoint_();
-  var daftarPoint = Object.keys(filterMap);
-  if (!daftarPoint.length) {
-    ui.alert('Tab filter masih kosong. Isi dulu "' +
-      FILTER_SHEETS.post_fraud + '" dan "' +
-      FILTER_SHEETS.bottom_performance + '".');
-    return;
-  }
-
-  var src = SpreadsheetApp.openById(cfg.sourceId);
-  var pointDiSource = {};   // normalized -> nama mentah pertama yang ditemui
-
-  tabs.forEach(function (tabName) {
-    var sheet = src.getSheetByName(tabName);
-    if (!sheet || sheet.getLastRow() < SOURCE_DATA_ROW) return;
-
-    var lastCol = sheet.getLastColumn();
-    var headers = sheet.getRange(SOURCE_HEADER_ROW, 1, 1, lastCol).getDisplayValues()[0];
-    var idxPoint = findColIdx_(headers, KEY_POINT);
-    if (idxPoint < 0) return;
-
-    var col = sheet.getRange(SOURCE_DATA_ROW, idxPoint + 1,
-                             sheet.getLastRow() - SOURCE_DATA_ROW + 1, 1)
-                   .getDisplayValues();
-    col.forEach(function (r) {
-      var v = String(r[0]).trim();
-      if (!v) return;
-      var k = normalizePoint_(v);
-      if (!pointDiSource[k]) pointDiSource[k] = v;
-    });
-  });
-
-  var tidakAdaDiSource = daftarPoint.filter(function (p) {
-    return !pointDiSource.hasOwnProperty(p);
-  });
-  var tidakAdaDiDaftar = Object.keys(pointDiSource).filter(function (p) {
-    return !filterMap.hasOwnProperty(p);
-  });
-
-  // Tulis hasil ke tab log agar bisa ditelusuri, bukan sekadar popup.
-  var sheet = sheetOrCreate_(LOG_SHEET);
-  var now = new Date();
-  var rows = [];
-
-  tidakAdaDiSource.forEach(function (p) {
-    rows.push([now, 'AUDIT', filterMap[p], tabs.join(' + '),
-      p + '  [ada di daftar, tidak ada di source]', 0,
-      cariKandidat_(p, Object.keys(pointDiSource))]);
-  });
-  tidakAdaDiDaftar.forEach(function (p) {
-    rows.push([now, 'AUDIT', '-', tabs.join(' + '),
-      pointDiSource[p] + '  [ada di source, tidak ada di daftar]', 0,
-      cariKandidat_(p, daftarPoint)]);
-  });
-
-  if (rows.length) {
-    if (sheet.getLastRow() === 0) {
-      sheet.getRange(1, 1, 1, 7).setValues([[
-        'waktu', 'periode', 'role', 'source_tab',
-        'nama_point_di_source', 'jumlah_baris', 'kandidat_mirip_di_daftar'
-      ]]).setFontWeight('bold');
-      sheet.setFrozenRows(1);
-    }
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
-  }
-
-  ui.alert('Hasil Audit',
-    'Point di daftar lu: ' + daftarPoint.length +
-    '\nPoint ditemukan di source: ' + Object.keys(pointDiSource).length +
-    '\n\nAda di daftar tapi tidak ada di source: ' + tidakAdaDiSource.length +
-    '\nAda di source tapi tidak ada di daftar: ' + tidakAdaDiDaftar.length +
-    (rows.length ? '\n\nDetail ditulis ke tab "' + LOG_SHEET + '".'
-                 : '\n\nSemua nama point cocok.'),
-    ui.ButtonSet.OK);
+  var menu = ui.createMenu('FO Performance')
+    .addItem('Cek Koneksi Sumber', 'cekKoneksiSumber')
+    .addItem('Ringkasan Data', 'ringkasanData')
+    .addItem('Preview Payload User', 'previewPayloadUser')
+    .addItem('Tes Sync (catat ke Log)', 'tesSyncManual')
+    .addItem('Buka Log Sync', 'bukaLogSync');
+  if (typeof previewHmb === 'function') menu.addItem('Preview Data HMB', 'previewHmb');
+  menu.addToUi();
 }
 
-function ringkasanArsip() {
-  var lines = [];
-  SEMUA_ARSIP.forEach(function (name) {
-    var sheet = ss_().getSheetByName(name);
-    if (!sheet || sheet.getLastRow() < 2) {
-      lines.push(name + ': kosong');
-      return;
-    }
-    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    var iPer = headers.indexOf('periode');
-    var data = sheet.getRange(2, iPer + 1, sheet.getLastRow() - 1, 1).getValues();
-
-    var count = {};
-    data.forEach(function (r) {
-      var p = String(r[0]).trim();
-      count[p] = (count[p] || 0) + 1;
-    });
-    var detail = Object.keys(count).sort().map(function (p) {
-      return '  ' + p + ': ' + count[p] + ' baris';
-    }).join('\n');
-    lines.push(name + ':\n' + detail);
+function cekKoneksiSumber() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = prodSS_();
+  var lines = ['Sumber: ' + ss.getName(), ''];
+  var need = [EMP_SHEET].concat(Object.keys(PERF_SHEET).map(function (r) { return PERF_SHEET[r]; }));
+  need.forEach(function (t) {
+    var s = ss.getSheetByName(t);
+    lines.push((s ? '✓ ' : '✗ ') + t + (s ? ' (' + (s.getLastRow() - 1) + ' baris)' : ' TIDAK ADA'));
   });
+  ui.alert('Cek Koneksi Sumber', lines.join('\n'), ui.ButtonSet.OK);
+}
 
-  SpreadsheetApp.getUi().alert('Ringkasan Arsip', lines.join('\n\n'),
-    SpreadsheetApp.getUi().ButtonSet.OK);
+function ringkasanData() {
+  var ui = SpreadsheetApp.getUi();
+  var emp = bacaEmployee_();
+  var lines = ['Employee ter-index: ' + Object.keys(emp).length, ''];
+  ['BP', 'BM', 'AM', 'RM'].forEach(function (role) {
+    var byNik = bacaPerf_(role);
+    var niks = Object.keys(byNik);
+    var cocok = niks.filter(function (n) { return emp[n]; }).length;
+    var kirim = roleDikirim_(role) ? ' [DIKIRIM]' : ' [ditahan]';
+    lines.push(role + ': ' + niks.length + ' orang, ' + cocok + ' cocok wilayah' + kirim);
+  });
+  ui.alert('Ringkasan Data', lines.join('\n'), ui.ButtonSet.OK);
+}
+
+/**
+ * Jalankan proses build seperti doGet, tapi manual dari menu — supaya bisa
+ * lihat hasil dan log tanpa menunggu backend memanggil. Mencatat ke Log Sync.
+ */
+function tesSyncManual() {
+  var ui = SpreadsheetApp.getUi();
+  var mulai = new Date().getTime();
+  try {
+    var stats = [];
+    var ringkasan = cfgRingkasanTimAktif_()
+      ? ringkasanTimPerNik_() : null;
+    var users = buildUsersFull_(ringkasan, stats);
+    var branches = buildBranchesFull_();
+    var durasi = ((new Date().getTime() - mulai) / 1000).toFixed(1) + 's';
+
+    catatLog_('tesManual', 'BERHASIL',
+      'users=' + users.length + ' branches=' + branches.length + ' | ' + durasi,
+      { stats: stats });
+
+    var ringkasStr = stats.map(function (s) {
+      return s.role + (s.dikirim ? ' [kirim]' : ' [tahan]') +
+             ': ' + s.lolos + '/' + s.total +
+             (s.skip_no_employee ? ' (skip ' + s.skip_no_employee + ' tak ada di DB_Employee)' : '');
+    }).join('\n');
+
+    ui.alert('Tes Sync Berhasil',
+      'Total user: ' + users.length + '\nTotal branch: ' + branches.length +
+      '\nDurasi: ' + durasi + '\n\nPer role:\n' + ringkasStr +
+      '\n\nDetail lengkap ada di tab "Log Sync".', ui.ButtonSet.OK);
+  } catch (err) {
+    catatLog_('tesManual', 'GAGAL', String(err && err.message ? err.message : err), {});
+    ui.alert('Tes Sync GAGAL', String(err) + '\n\nDicatat di tab "Log Sync".', ui.ButtonSet.OK);
+  }
+}
+
+function bukaLogSync() {
+  var sheet = ss_().getSheetByName('Log Sync');
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Belum ada log. Jalankan "Tes Sync" dulu, atau tunggu backend memanggil.');
+    return;
+  }
+  ss_().setActiveSheet(sheet);
+}
+
+function previewPayloadUser() {
+  var ui = SpreadsheetApp.getUi();
+  var users = buildUsers_(null);
+  if (!users.length) { ui.alert('Tidak ada user (cek ROLE_DIKIRIM & data).'); return; }
+
+  var sheet = sheetOrCreate_('Preview Payload');
+  sheet.clear();
+  var contoh = users[0];
+  var baris = [['Field', 'Nilai (' + contoh.full_name + ' / ' + contoh.role + ')']];
+  Object.keys(contoh).forEach(function (k) {
+    baris.push([k, String(contoh[k])]);
+  });
+  sheet.getRange(1, 1, baris.length, 2).setValues(baris);
+  sheet.getRange(1, 1, 1, 2).setFontWeight('bold');
+  ss_().setActiveSheet(sheet);
+  ui.alert('Preview Payload',
+    'Total user dikirim: ' + users.length +
+    '\nContoh baris pertama ada di tab "Preview Payload".', ui.ButtonSet.OK);
 }
