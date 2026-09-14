@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<style>
+  :root {
+    --bg: #f7f8f7;
+    --panel: #ffffff;
+    --ink: #1a2420;
+    --muted: #6b7770;
+    --line: #e3e7e4;
+    --go: #1f7a54;          /* hijau tindakan: tandai final */
+    --go-dark: #155c3e;
+    --warn: #b5540a;
+    --hold: #8a6d3b;
+    --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--font); font-size: 14px; line-height: 1.5;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 20px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 13px; text-transform: none; color: var(--muted);
+    margin: 0 0 14px; font-weight: 600; }
+  label { display: block; font-size: 13px; margin-bottom: 6px; color: var(--ink); }
+  input[type=password], input[type=text], select {
+    width: 100%; padding: 9px 11px; border: 1px solid var(--line);
+    border-radius: 7px; font-family: var(--font); font-size: 14px; background: #fff;
+  }
+  input:focus, select:focus { outline: 2px solid var(--go); outline-offset: 0; border-color: var(--go); }
+  button {
+    font-family: var(--font); font-size: 14px; font-weight: 600;
+    border: none; border-radius: 7px; padding: 10px 16px; cursor: pointer;
+  }
+  .btn-go { background: var(--go); color: #fff; }
+  .btn-go:hover { background: var(--go-dark); }
+  .btn-ghost { background: #fff; color: var(--ink); border: 1px solid var(--line); }
+  .btn-ghost:hover { border-color: var(--muted); }
+  .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 180px; }
+  .hide { display: none; }
+  .msg { padding: 10px 12px; border-radius: 7px; font-size: 13px; margin-bottom: 14px; }
+  .msg-err { background: #fdecea; color: #a3352a; }
+  .msg-ok { background: #e8f4ee; color: #155c3e; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .pill-final { background: #e8f4ee; color: var(--go-dark); }
+  .pill-hold { background: #f3ede0; color: var(--hold); }
+  .togglegrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 20px; }
+  .togglegrid label { display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0; }
+  .togglegrid input { width: auto; }
+  .cur { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .cur b { color: var(--ink); }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>FO KPI Command Center</h1>
+  <div class="sub">Kontrol data yang dikirim ke AI Trainer (Ava)</div>
+
+  <!-- LOGIN -->
+  <div id="loginPanel" class="panel">
+    <h2>Masuk</h2>
+    <div id="loginMsg"></div>
+    <div class="row">
+      <div>
+        <label>Password</label>
+        <input type="password" id="pw" onkeydown="if(event.key==='Enter')login()">
+      </div>
+      <button class="btn-go" onclick="login()">Masuk</button>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div id="main" class="hide">
+    <div id="mainMsg"></div>
+
+    <!-- Periode final -->
+    <div class="panel">
+      <h2>Periode final — data yang dikirim ke Ava</h2>
+      <p style="margin:0 0 14px;color:var(--muted);font-size:13px">
+        Ava hanya menerima data sampai periode yang ditandai final. Periode lebih
+        baru yang belum final tidak dikirim, sehingga saat PROD sedang diupdate,
+        Ava tetap menampilkan data final terakhir.
+      </p>
+      <div class="cur">Final saat ini: <b id="curFinal">—</b></div>
+      <div class="row" style="margin-top:14px">
+        <div>
+          <label>Pilih periode untuk ditandai final</label>
+          <select id="selPeriode" onchange="cekLengkap()"></select>
+        </div>
+        <button class="btn-go" onclick="tandaiFinal()">Tandai final &amp; kirim</button>
+      </div>
+      <div id="lengkapBox" style="margin-top:16px"></div>
+    </div>
+
+    <!-- Kontrol pengiriman -->
+    <div class="panel">
+      <h2>Kontrol pengiriman</h2>
+      <div class="row" style="margin-bottom:16px">
+        <div>
+          <label>Role yang dikirim (pisahkan koma)</label>
+          <input type="text" id="cfgRole" placeholder="BP,BM">
+        </div>
+      </div>
+      <div class="togglegrid">
+        <label><input type="checkbox" id="cfgInsentif"> Sembunyikan insentif</label>
+        <label><input type="checkbox" id="cfgRiwayat"> Kirim riwayat minggu lama</label>
+        <label><input type="checkbox" id="cfgAgregat"> Kirim agregat point</label>
+      </div>
+      <div class="row" style="margin-top:16px">
+        <div>
+          <label>Kolom disembunyikan (kata kunci, pisahkan koma)</label>
+          <input type="text" id="cfgKolom" placeholder="mis. cohort, celengan">
+        </div>
+      </div>
+      <div style="margin-top:16px">
+        <button class="btn-ghost" onclick="simpanKontrol()">Simpan kontrol</button>
+      </div>
+    </div>
+
+    <!-- Ringkasan tim & granular -->
+    <div class="panel">
+      <h2>Ringkasan tim &amp; akses atasan</h2>
+      <div class="togglegrid">
+        <label><input type="checkbox" id="cfgRingkasan"> Kirim ringkasan tim ke atasan</label>
+        <label><input type="checkbox" id="cfgGranular"> Kirim data granular tiap bawahan</label>
+      </div>
+      <div class="row" style="margin-top:16px">
+        <div>
+          <label>Role penerima granular (pisahkan koma)</label>
+          <input type="text" id="cfgGranularRole" placeholder="BM">
+        </div>
+        <div>
+          <label>Batas bawahan granular per atasan (0 = tanpa batas)</label>
+          <input type="text" id="cfgGranularMaks" placeholder="10">
+        </div>
+      </div>
+      <p style="margin:12px 0 0;color:var(--muted);font-size:13px">
+        Granular untuk role besar (RM) membuat konteks membengkak di setiap
+        query. Batasi jumlah bawahan, atau aktifkan hanya untuk BM.
+      </p>
+      <div style="margin-top:16px">
+        <button class="btn-ghost" onclick="simpanTim()">Simpan ringkasan tim</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">Perubahan langsung berlaku pada permintaan berikutnya dari Ava.</div>
+</div>
+
+<script>
+  var PW = '';
+
+  function show(el, cls, txt) {
+    document.getElementById(el).innerHTML =
+      '<div class="msg ' + cls + '">' + txt + '</div>';
+    if (cls === 'msg-ok') setTimeout(function(){ document.getElementById(el).innerHTML=''; }, 3000);
+  }
+
+  function login() {
+    var pw = document.getElementById('pw').value;
+    if (!pw) { show('loginMsg','msg-err','Password kosong.'); return; }
+    show('loginMsg','msg-ok','Memeriksa…');
+    google.script.run
+      .withSuccessHandler(function(res){
+        if (res && res.ok) { PW = pw; document.getElementById('loginMsg').innerHTML=''; loadStatus(); }
+        else show('loginMsg', 'msg-err', 'Password salah.');
+      })
+      .withFailureHandler(function(err){
+        show('loginMsg', 'msg-err', 'Gagal menghubungi server: ' + (err && err.message ? err.message : err) +
+             '<br><small>Pastikan Code.gs & CommandCenter.html di project yang sama, lalu Deploy versi baru.</small>');
+      })
+      .cc_login(pw);
+  }
+
+  function loadStatus() {
+    google.script.run
+      .withSuccessHandler(function(res){
+        if (!res || res.error) { show('loginMsg','msg-err','Gagal memuat data.'); return; }
+        document.getElementById('loginPanel').classList.add('hide');
+        document.getElementById('main').classList.remove('hide');
+        render(res);
+      })
+      .withFailureHandler(function(err){
+        show('loginMsg','msg-err','Gagal memuat: ' + (err && err.message ? err.message : err));
+      })
+      .cc_getStatus(PW);
+  }
+
+  function render(res) {
+    var cfg = res.config;
+    document.getElementById('curFinal').textContent = cfg.periode_final || '(belum diset — pakai terbaru)';
+
+    var sel = document.getElementById('selPeriode');
+    sel.innerHTML = '';
+    res.periode.forEach(function(p){
+      var o = document.createElement('option');
+      o.value = p.label; o.textContent = p.label;
+      if (p.label === cfg.periode_final) o.selected = true;
+      sel.appendChild(o);
+    });
+
+    document.getElementById('cfgRole').value = cfg.role_dikirim || '';
+    document.getElementById('cfgKolom').value = cfg.kolom_disembunyikan || '';
+    document.getElementById('cfgInsentif').checked = /^true$/i.test(cfg.sembunyikan_insentif);
+    document.getElementById('cfgRiwayat').checked = /^true$/i.test(cfg.kirim_riwayat);
+    document.getElementById('cfgAgregat').checked = /^true$/i.test(cfg.kirim_agregat_point);
+
+    document.getElementById('cfgRingkasan').checked = /^true$/i.test(cfg.ringkasan_tim_aktif);
+    document.getElementById('cfgGranular').checked = /^true$/i.test(cfg.granular_aktif);
+    document.getElementById('cfgGranularRole').value = cfg.granular_untuk_role || '';
+    document.getElementById('cfgGranularMaks').value = cfg.granular_maks_bawahan || '';
+
+    cekLengkap();
+  }
+
+  function cekLengkap() {
+    var label = document.getElementById('selPeriode').value;
+    if (!label) return;
+    document.getElementById('lengkapBox').innerHTML = '<div class="cur">Menghitung kelengkapan…</div>';
+    google.script.run
+     .withFailureHandler(function(err){ document.getElementById('lengkapBox').innerHTML='<div class="cur">Gagal: '+(err&&err.message?err.message:err)+'</div>'; })
+     .withSuccessHandler(function(res){
+      if (!res || res.error) return;
+      var k = res.kelengkapan;
+      var html = '<table><tr><th>Role</th><th class="num">Jumlah baris</th></tr>';
+      ['BP','BM','AM','RM'].forEach(function(r){
+        html += '<tr><td>'+r+'</td><td class="num">'+(k[r]||0)+'</td></tr>';
+      });
+      html += '</table>';
+      document.getElementById('lengkapBox').innerHTML = html;
+    }).cc_cekKelengkapan(PW, label);
+  }
+
+  function tandaiFinal() {
+    var label = document.getElementById('selPeriode').value;
+    if (!label) return;
+    if (!confirm('Tandai "'+label+'" sebagai final dan kirim ke Ava?')) return;
+    google.script.run
+     .withFailureHandler(function(err){ show('mainMsg','msg-err','Gagal: '+(err&&err.message?err.message:err)); })
+     .withSuccessHandler(function(res){
+      if (!res || res.error) { show('mainMsg','msg-err','Gagal menyimpan.'); return; }
+      document.getElementById('curFinal').textContent = label;
+      show('mainMsg','msg-ok','Periode final diset ke '+label+'. Ava akan menerima data ini.');
+    }).cc_saveConfig(PW, { periode_final: label });
+  }
+
+  function simpanKontrol() {
+    var patch = {
+      role_dikirim: document.getElementById('cfgRole').value,
+      kolom_disembunyikan: document.getElementById('cfgKolom').value,
+      sembunyikan_insentif: document.getElementById('cfgInsentif').checked ? 'true' : 'false',
+      kirim_riwayat: document.getElementById('cfgRiwayat').checked ? 'true' : 'false',
+      kirim_agregat_point: document.getElementById('cfgAgregat').checked ? 'true' : 'false'
+    };
+    google.script.run
+     .withFailureHandler(function(err){ show('mainMsg','msg-err','Gagal: '+(err&&err.message?err.message:err)); })
+     .withSuccessHandler(function(res){
+      if (!res || res.error) { show('mainMsg','msg-err','Gagal menyimpan.'); return; }
+      show('mainMsg','msg-ok','Kontrol pengiriman disimpan.');
+    }).cc_saveConfig(PW, patch);
+  }
+
+  function simpanTim() {
+    var patch = {
+      ringkasan_tim_aktif: document.getElementById('cfgRingkasan').checked ? 'true' : 'false',
+      granular_aktif: document.getElementById('cfgGranular').checked ? 'true' : 'false',
+      granular_untuk_role: document.getElementById('cfgGranularRole').value,
+      granular_maks_bawahan: document.getElementById('cfgGranularMaks').value
+    };
+    google.script.run
+     .withFailureHandler(function(err){ show('mainMsg','msg-err','Gagal: '+(err&&err.message?err.message:err)); })
+     .withSuccessHandler(function(res){
+      if (!res || res.error) { show('mainMsg','msg-err','Gagal menyimpan.'); return; }
+      show('mainMsg','msg-ok','Pengaturan ringkasan tim disimpan.');
+    }).cc_saveConfig(PW, patch);
+  }
+</script>
+</body>
+</html>
