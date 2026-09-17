@@ -152,23 +152,53 @@ function daftarPeriode_() {
 }
 
 /** Hitung jumlah baris per role untuk sebuah periode (untuk cek kelengkapan). */
+/** Hitung detail kelengkapan: mentah, lolos validasi, dan HMB. */
 function kelengkapanPeriode_(label) {
   var targetKey = parsePeriodeMingguan_(label).key;
-  var hasil = {};
+  var emp = bacaEmployee_();
+  var hasil = { roles: {}, total_raw: 0, total_lolos: 0, hmb: 0, total_kirim: 0 };
+
   ['BP', 'BM', 'AM', 'RM'].forEach(function (role) {
     var sheet = prodSS_().getSheetByName(PERF_SHEET[role]);
-    if (!sheet || sheet.getLastRow() < 2) { hasil[role] = 0; return; }
-    var lastCol = sheet.getLastColumn();
-    var header = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
-                 .map(function (h) { return String(h).trim().toLowerCase(); });
+    if (!sheet || sheet.getLastRow() < 2) {
+      hasil.roles[role] = { raw: 0, lolos: 0, skip: 0 };
+      return;
+    }
+
+    var values = sheet.getDataRange().getValues();
+    var header = values[0].map(function (h) { return String(h).trim().toLowerCase(); });
     var iPer = header.indexOf('perioda_tanggal');
-    var col = sheet.getRange(2, iPer + 1, sheet.getLastRow() - 1, 1).getValues();
-    var n = 0;
-    col.forEach(function (r) {
-      if (parsePeriodeMingguan_(String(r[0] || '').trim()).key === targetKey) n++;
-    });
-    hasil[role] = n;
+    var iNik = header.indexOf('nik');
+
+    if (iPer < 0 || iNik < 0) {
+      hasil.roles[role] = { raw: 0, lolos: 0, skip: 0 };
+      return;
+    }
+    
+    var raw = 0, lolos = 0, seenNik = {};
+    for (var r = 1; r < values.length; r++) {
+      if (parsePeriodeMingguan_(String(values[r][iPer] || '').trim()).key !== targetKey) continue;
+      raw++;
+      var nik = normNik_(values[r][iNik]);
+      if (nik && emp[nik] && !seenNik[nik]) {
+        seenNik[nik] = true;
+        lolos++;
+      }
+    }
+    hasil.roles[role] = { raw: raw, lolos: lolos, skip: raw - lolos };
+    hasil.total_raw += raw;
+    hasil.total_lolos += lolos;
   });
+
+  // Hitung HMB jika tab ada
+  try {
+    var daftarHmb = (typeof bacaDaftarHmb_ === 'function') ? bacaDaftarHmb_() : [];
+    hasil.hmb = daftarHmb.length;
+  } catch (e) {
+    hasil.hmb = 0;
+  }
+
+  hasil.total_kirim = hasil.total_lolos + hasil.hmb;
   return hasil;
 }
 
@@ -230,25 +260,43 @@ function getConfig_() {
  * buka lewat PROD_SPREADSHEET_ID. getActiveSpreadsheet() hanya dipakai sebagai
  * fallback saat dijalankan dari editor/menu (mis. saat ID belum diisi).
  */
+/**
+ * Spreadsheet OPERASIONAL — tempat tab _Status, Log Sync, Preview dibuat.
+ * Ini spreadsheet milik script, TERPISAH dari PROD sumber data.
+ *
+ * Urutan: OPS_SPREADSHEET_ID (kalau diisi) -> spreadsheet aktif (saat
+ * dijalankan dari editor/menu). Di web app, OPS_SPREADSHEET_ID wajib diisi
+ * karena tidak ada spreadsheet aktif.
+ */
 function ss_() {
-  var cfg = getConfig_();
-  if (cfg.prodId) {
-    try { return SpreadsheetApp.openById(cfg.prodId); } catch (e) { /* fallback */ }
+  var props = PropertiesService.getScriptProperties();
+  var opsId = props.getProperty('OPS_SPREADSHEET_ID') || '';
+  if (opsId) {
+    try { return SpreadsheetApp.openById(opsId); } catch (e) { /* fallback */ }
   }
   var active = SpreadsheetApp.getActiveSpreadsheet();
   if (active) return active;
-  throw new Error('PROD_SPREADSHEET_ID belum diisi di Script Properties, dan tidak ada spreadsheet aktif. Isi PROD_SPREADSHEET_ID dulu.');
+  throw new Error('OPS_SPREADSHEET_ID belum diisi di Script Properties. Isi dengan ID spreadsheet tempat script ini menempel (untuk _Status & Log Sync).');
+}
+
+/**
+ * Spreadsheet PROD — sumber data KPI (DB_Perf, DB_Employee). Hanya dibaca,
+ * tidak pernah ditulis. Wajib PROD_SPREADSHEET_ID.
+ */
+function prodSS_() {
+  var cfg = getConfig_();
+  if (cfg.prodId) {
+    try { return SpreadsheetApp.openById(cfg.prodId); } catch (e) {
+      throw new Error('Gagal membuka PROD (PROD_SPREADSHEET_ID). Cek ID & akses.');
+    }
+  }
+  throw new Error('PROD_SPREADSHEET_ID belum diisi di Script Properties.');
 }
 
 function sheetOrCreate_(name) {
   var s = ss_().getSheetByName(name);
   if (!s) s = ss_().insertSheet(name);
   return s;
-}
-
-/** Buka spreadsheet PROD. Sama dengan ss_ karena semua data ada di PROD. */
-function prodSS_() {
-  return ss_();
 }
 
 /** Normalisasi NIK agar join tidak gagal karena string vs float. */
