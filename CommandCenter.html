@@ -226,19 +226,34 @@
     cekLengkap();
   }
 
-  function cekLengkap() {
+    function cekLengkap() {
     var label = document.getElementById('selPeriode').value;
     if (!label) return;
     document.getElementById('lengkapBox').innerHTML = '<div class="cur">Menghitung kelengkapan…</div>';
     google.script.run
-     .withFailureHandler(function(err){ document.getElementById('lengkapBox').innerHTML='<div class="cur">Gagal: '+(err&&err.message?err.message:err)+'</div>'; })
+     .withFailureHandler(function(err){ 
+       document.getElementById('lengkapBox').innerHTML='<div class="cur">Gagal: '+(err&&err.message?err.message:err)+'</div>'; 
+     })
      .withSuccessHandler(function(res){
       if (!res || res.error) return;
       var k = res.kelengkapan;
-      var html = '<table><tr><th>Role</th><th class="num">Jumlah baris</th></tr>';
+      var html = '<table>' +
+                 '<tr><th>Role</th><th class="num">Baris Sheet</th><th class="num">Skip (Kotor)</th><th class="num">Siap Kirim</th></tr>';
+      
       ['BP','BM','AM','RM'].forEach(function(r){
-        html += '<tr><td>'+r+'</td><td class="num">'+(k[r]||0)+'</td></tr>';
+        var item = (k.roles && k.roles[r]) || { raw: 0, skip: 0, lolos: 0 };
+        html += '<tr><td>'+r+'</td><td class="num">'+item.raw+'</td><td class="num" style="color:var(--warn)">'+item.skip+'</td><td class="num"><b>'+item.lolos+'</b></td></tr>';
       });
+      
+      if (k.hmb) {
+        html += '<tr><td>HMB (Daftar HMB)</td><td class="num">'+k.hmb+'</td><td class="num">0</td><td class="num"><b>'+k.hmb+'</b></td></tr>';
+      }
+
+      html += '<tr style="border-top:2px solid var(--line);font-weight:bold">' +
+              '<td>TOTAL</td>' +
+              '<td class="num">'+k.total_raw+'</td>' +
+              '<td class="num" style="color:var(--warn)">'+(k.total_raw - k.total_lolos)+'</td>' +
+              '<td class="num" style="color:var(--go)">'+k.total_kirim+'</td></tr>';
       html += '</table>';
       document.getElementById('lengkapBox').innerHTML = html;
     }).cc_cekKelengkapan(PW, label);
